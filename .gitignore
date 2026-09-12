@@ -1,0 +1,28 @@
+# Claude Code harness (session-local state)
+.claude/harness.local.json
+.claude/*.local.*
+.claude/settings.local.json
+.claude/ralph-loop.local.md
+
+# Secrets
+.env
+.env.*
+!.env.example
+secrets/
+
+# Dependencies / build
+node_modules/
+dist/
+build/
+.next/
+.vercel/
+coverage/
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log
