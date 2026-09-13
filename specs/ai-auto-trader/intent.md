@@ -2,7 +2,7 @@
 
 - 作成日: 2026-09-13
 - 更新日: 2026-09-14（kyo の指摘で核を書き直し。旧名 `trade-decision-journal` は「判断の記録」が主役になっていて元の案から外れていた）
-- 状態: draft
+- 状態: approved
 - 旧仮称: `ai-stock-picker` → `trade-decision-journal` → `ai-auto-trader`
 
 ## 問題
@@ -80,5 +80,5 @@ kyo が手で読んで手で売買するなら、時間も判断の一貫性も�
 
 ## 承認
 
-approved_by:
-approved_at:
+approved_by: kyo
+approved_at: 2026-09-14
