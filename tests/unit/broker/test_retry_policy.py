@@ -53,10 +53,16 @@ class _FakeTradingClient:
         self,
         submit_order: Any = None,
         get_order_by_client_id: Any = None,
+        get_all_positions: Any = None,
+        get_account: Any = None,
+        cancel_orders: Any = None,
         session: Any = None,
     ) -> None:
         self.submit_order = submit_order or (lambda order_data: _raw_order())
         self.get_order_by_client_id = get_order_by_client_id or (lambda client_id: _raw_order())
+        self.get_all_positions = get_all_positions or (lambda: [])
+        self.get_account = get_account or (lambda: {"cash": "100", "equity": "150"})
+        self.cancel_orders = cancel_orders or (lambda: [])
         if session is not None:
             self._session = session
 
@@ -91,6 +97,41 @@ def test_submit_market_order_is_not_retried_on_exception() -> None:
     assert sleeps == []
 
 
+def test_submit_market_order_is_not_retried_on_invalid_response() -> None:
+    """An unparseable response is a permanent failure, not a retry trigger:
+    the SDK call must still only happen once (AC-24)."""
+    flaky = _FlakyCall([{"not": "a valid order"}])
+    sleeps: list[Decimal] = []
+    broker = _broker(client=_FakeTradingClient(submit_order=flaky), sleep=sleeps.append)
+
+    result = broker.submit_market_order(_req())
+
+    assert isinstance(result, Err)
+    assert flaky.calls == 1
+    assert sleeps == []
+
+
+def test_submit_market_order_passes_client_order_id_side_qty_and_day_tif() -> None:
+    captured: list[Any] = []
+
+    def submit_order(order_data: Any) -> Any:
+        captured.append(order_data)
+        return _raw_order(client_order_id=order_data.client_order_id)
+
+    broker = _broker(client=_FakeTradingClient(submit_order=submit_order))
+
+    result = broker.submit_market_order(_req(client_order_id="client-xyz"))
+
+    assert isinstance(result, Ok)
+    assert len(captured) == 1
+    sent = captured[0]
+    assert sent.client_order_id == "client-xyz"
+    assert sent.symbol == "AAPL"
+    assert sent.qty == 7
+    assert sent.side.value == "buy"
+    assert sent.time_in_force.value == "day"
+
+
 def test_get_order_retries_and_succeeds_after_two_failures() -> None:
     flaky = _FlakyCall([RuntimeError("net"), RuntimeError("net"), _raw_order()])
     sleeps: list[Decimal] = []
@@ -113,6 +154,62 @@ def test_get_order_gives_up_after_max_attempts() -> None:
 
     assert isinstance(result, Err)
     assert flaky.calls == 3
+
+
+def test_positions_retries_and_succeeds_after_two_failures() -> None:
+    flaky = _FlakyCall([RuntimeError("net"), RuntimeError("net"), []])
+    sleeps: list[Decimal] = []
+    broker = _broker(client=_FakeTradingClient(get_all_positions=flaky), sleep=sleeps.append)
+
+    result = broker.positions()
+
+    assert isinstance(result, Ok)
+    assert flaky.calls == 3
+    assert sleeps == [Decimal("0.5"), Decimal("1")]
+
+
+def test_positions_gives_up_after_max_attempts() -> None:
+    flaky = _FlakyCall([RuntimeError("net"), RuntimeError("net"), RuntimeError("net")])
+    broker = _broker(client=_FakeTradingClient(get_all_positions=flaky), sleep=lambda _d: None)
+
+    result = broker.positions()
+
+    assert isinstance(result, Err)
+    assert flaky.calls == 3
+
+
+def test_account_retries_and_succeeds_after_two_failures() -> None:
+    flaky = _FlakyCall([RuntimeError("net"), RuntimeError("net"), {"cash": "100", "equity": "150"}])
+    sleeps: list[Decimal] = []
+    broker = _broker(client=_FakeTradingClient(get_account=flaky), sleep=sleeps.append)
+
+    result = broker.account()
+
+    assert isinstance(result, Ok)
+    assert flaky.calls == 3
+    assert sleeps == [Decimal("0.5"), Decimal("1")]
+
+
+def test_account_gives_up_after_max_attempts() -> None:
+    flaky = _FlakyCall([RuntimeError("net"), RuntimeError("net"), RuntimeError("net")])
+    broker = _broker(client=_FakeTradingClient(get_account=flaky), sleep=lambda _d: None)
+
+    result = broker.account()
+
+    assert isinstance(result, Err)
+    assert flaky.calls == 3
+
+
+def test_cancel_all_open_is_not_retried_on_exception() -> None:
+    flaky = _FlakyCall([RuntimeError("net"), []])
+    sleeps: list[Decimal] = []
+    broker = _broker(client=_FakeTradingClient(cancel_orders=flaky), sleep=sleeps.append)
+
+    result = broker.cancel_all_open()
+
+    assert isinstance(result, Err)
+    assert flaky.calls == 1
+    assert sleeps == []
 
 
 def test_timeout_is_installed_on_the_client_session() -> None:

@@ -7,6 +7,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
+import pytest
 from pydantic import SecretStr
 
 from trader.broker.alpaca_broker import AlpacaBroker
@@ -86,6 +87,60 @@ def test_negative_filled_avg_price_is_rejected_without_leaking_the_value() -> No
 
     assert isinstance(result, Err)
     assert "-10.5" not in result.error.message
+
+
+def test_non_integer_filled_qty_is_rejected() -> None:
+    raw = _raw_order(filled_qty="1.5")
+    broker = _broker(_FakeTradingClient(get_order_by_client_id=lambda client_id: raw))
+
+    result = broker.get_order("client-1")
+
+    assert isinstance(result, Err)
+    assert "1.5" not in result.error.message
+
+
+def test_filled_avg_price_none_is_accepted_for_an_unfilled_order() -> None:
+    raw = _raw_order(status="new", filled_qty="0", filled_avg_price=None)
+    broker = _broker(_FakeTradingClient(get_order_by_client_id=lambda client_id: raw))
+
+    result = broker.get_order("client-1")
+
+    assert isinstance(result, Ok)
+    assert result.value.filled_avg_price is None
+    assert result.value.filled_qty.shares == 0
+
+
+@pytest.mark.parametrize(
+    ("raw_status", "expected"),
+    [
+        ("new", "submitted"),
+        ("accepted", "submitted"),
+        ("pending_new", "submitted"),
+        ("partially_filled", "partially_filled"),
+        ("filled", "filled"),
+        ("canceled", "canceled"),
+        ("expired", "canceled"),
+        ("rejected", "rejected"),
+    ],
+)
+def test_known_statuses_map_to_the_expected_domain_status(raw_status: str, expected: str) -> None:
+    raw = _raw_order(status=raw_status, filled_qty="0", filled_avg_price=None)
+    broker = _broker(_FakeTradingClient(get_order_by_client_id=lambda client_id: raw))
+
+    result = broker.get_order("client-1")
+
+    assert isinstance(result, Ok)
+    assert result.value.status.value == expected
+
+
+def test_unknown_status_foo_is_rejected_without_leaking_the_value() -> None:
+    raw = _raw_order(status="foo")
+    broker = _broker(_FakeTradingClient(get_order_by_client_id=lambda client_id: raw))
+
+    result = broker.get_order("client-1")
+
+    assert isinstance(result, Err)
+    assert "foo" not in result.error.message
 
 
 def test_valid_response_is_accepted() -> None:
