@@ -2,7 +2,7 @@
 
 - 元 intent: `specs/ai-auto-trader/intent.md`（approved_by: kyo, approved_at: 2026-09-14）
 - 作成日: 2026-09-13（改訂: 2026-09-14、kyo のレビュー 2 回分を反映）
-- 状態: draft
+- 状態: approved
 
 > **kyo へ**: 2026-09-14 の回答（証券会社 (a) 確定 / 実弾 $2,000 は怖い）を反映した。売買ルールは**全て資金に対する割合**で定義し直し、
 > 資金額 `capital_usd` の既定を **$500** に下げた。作戦（比率）は資金額に依存しないので、kyo が決めるのは資金額だけでよい。
@@ -498,5 +498,5 @@ kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券は
 
 ## 承認
 
-approved_by:
-approved_at:
+approved_by: kyo
+approved_at: 2026-09-14
