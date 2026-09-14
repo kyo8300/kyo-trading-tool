@@ -254,3 +254,187 @@ def test_selling_without_a_position_is_an_error() -> None:
     )
 
     assert is_err(result)
+
+
+def test_AC20_same_day_close_has_zero_holding_days() -> None:
+    """AC-20: a position opened and closed on the same calendar day."""
+    opened_at = datetime(2026, 1, 5, 14, 0, tzinfo=UTC)
+    closed_at = datetime(2026, 1, 5, 20, 0, tzinfo=UTC)
+    opened = apply_fill(
+        None, _fill("f1", 2, "10", filled_at=opened_at), _decision("dec-buy"), Side.buy, opened_at
+    ).value
+    position = opened.position
+
+    result = apply_fill(
+        position,
+        _fill("f2", 2, "11", filled_at=closed_at),
+        _decision("dec-sell", action=Action.sell),
+        Side.sell,
+        closed_at,
+        ExitReason.stop_loss,
+        entry_decision_id="dec-buy",
+    )
+
+    assert is_ok(result)
+    update = result.value
+    assert isinstance(update, ClosedTrade)
+    assert update.trade.holding_days == 0
+
+
+def test_AC20_holding_days_uses_calendar_date_not_elapsed_hours() -> None:
+    """Crossing a UTC midnight boundary counts as 1 calendar day even though
+    less than 24 hours elapsed between the fills."""
+    opened_at = datetime(2026, 1, 5, 23, 50, tzinfo=UTC)
+    closed_at = datetime(2026, 1, 6, 0, 10, tzinfo=UTC)
+    opened = apply_fill(
+        None, _fill("f1", 2, "10", filled_at=opened_at), _decision("dec-buy"), Side.buy, opened_at
+    ).value
+    position = opened.position
+
+    result = apply_fill(
+        position,
+        _fill("f2", 2, "11", filled_at=closed_at),
+        _decision("dec-sell", action=Action.sell),
+        Side.sell,
+        closed_at,
+        ExitReason.stop_loss,
+        entry_decision_id="dec-buy",
+    )
+
+    assert is_ok(result)
+    update = result.value
+    assert isinstance(update, ClosedTrade)
+    # only 20 minutes elapsed, but the calendar date advanced by one
+    assert update.trade.holding_days == 1
+
+
+def test_AC20_fees_accumulate_across_partial_sells() -> None:
+    """Two 0.50 fees across a partial take-profit and a trailing-stop sell
+    accumulate to 1.00 on the closed trade."""
+    opened = apply_fill(None, _fill("f1", 10, "10"), _decision("dec-buy"), Side.buy, _NOW).value
+    position = opened.position
+
+    partial_decision = _decision("dec-partial", action=Action.sell)
+    partial_update = apply_fill(
+        position,
+        _fill("f2", 5, "13", fee="0.50"),
+        partial_decision,
+        Side.sell,
+        _NOW,
+        ExitReason.partial_take_profit,
+        entry_decision_id="dec-buy",
+    ).value
+    assert isinstance(partial_update, OpenPosition)
+
+    trailing_decision = _decision("dec-trailing", action=Action.sell)
+    final_result = apply_fill(
+        partial_update.position,
+        _fill("f3", 5, "12", fee="0.50"),
+        trailing_decision,
+        Side.sell,
+        _NOW,
+        ExitReason.trailing_stop,
+        entry_decision_id="dec-buy",
+        exit_decision_ids=(partial_decision.id,),
+        realized_so_far=Money(Decimal("14.50")),  # (13-10)*5 - 0.50
+        fees_so_far=Money(Decimal("0.50")),
+    )
+
+    assert is_ok(final_result)
+    trade = final_result.value.trade  # type: ignore[union-attr]
+    assert trade.fees == Money(Decimal("1.00"))
+    assert trade.exit_decision_ids == ("dec-partial", "dec-trailing")
+
+
+def test_AC20_additional_buy_computes_weighted_average_cost_to_four_places() -> None:
+    """7 @10 then 3 @12 averages to 10.6000, quantized to 4 places, and
+    retains the first fill's opened_at."""
+    opened = apply_fill(None, _fill("f1", 7, "10"), _decision("dec-buy-1"), Side.buy, _NOW).value
+    position = opened.position
+
+    result = apply_fill(position, _fill("f2", 3, "12"), _decision("dec-buy-2"), Side.buy, _NOW)
+
+    assert is_ok(result)
+    update = result.value
+    assert isinstance(update, OpenPosition)
+    # (7*10 + 3*12) / 10 = 10.6000
+    assert update.position.avg_cost == Price(Decimal("10.6000"))
+    assert update.position.qty == Quantity(10)
+    assert update.position.opened_at == _NOW
+
+
+def test_AC20_high_watermark_is_the_max_seen_price_after_an_additional_buy() -> None:
+    """A second buy above the current high_watermark should raise it, not
+    silently keep the pre-buy value (trailing-stop math depends on this)."""
+    opened = apply_fill(None, _fill("f1", 7, "10"), _decision("dec-buy-1"), Side.buy, _NOW).value
+    position = opened.position
+    assert position.high_watermark == Price(Decimal("10"))
+
+    result = apply_fill(position, _fill("f2", 3, "12"), _decision("dec-buy-2"), Side.buy, _NOW)
+
+    assert is_ok(result)
+    update = result.value
+    assert isinstance(update, OpenPosition)
+    assert update.position.high_watermark == Price(Decimal("12"))
+
+
+def test_AC20_fee_can_turn_a_profitable_price_move_into_a_loss() -> None:
+    """price > avg_cost, but the fee outweighs the small per-share gain."""
+    opened = apply_fill(None, _fill("f1", 1, "10"), _decision("dec-buy"), Side.buy, _NOW).value
+    position = opened.position
+
+    result = apply_fill(
+        position,
+        _fill("f2", 1, "10.05", fee="1.00"),
+        _decision("dec-sell", action=Action.sell),
+        Side.sell,
+        _NOW,
+        ExitReason.max_holding_days,
+        entry_decision_id="dec-buy",
+    )
+
+    assert is_ok(result)
+    update = result.value
+    assert isinstance(update, ClosedTrade)
+    # (10.05 - 10) * 1 - 1.00 = -0.95
+    assert update.trade.realized_pnl == Money(Decimal("-0.95"))
+
+
+def test_AC20_zero_qty_fill_is_a_pinned_no_op_not_a_silent_error() -> None:
+    """Current documented behavior: a zero-quantity sell fill does not
+    reduce the position and only subtracts its fee. This test pins that
+    decision so a future change to reject zero-qty fills is a deliberate
+    one, not an accidental regression."""
+    opened = apply_fill(None, _fill("f1", 5, "10"), _decision("dec-buy"), Side.buy, _NOW).value
+    position = opened.position
+
+    result = apply_fill(
+        position,
+        _fill("f2", 0, "10", fee="0.10"),
+        _decision("dec-sell", action=Action.sell),
+        Side.sell,
+        _NOW,
+        ExitReason.stop_loss,
+    )
+
+    assert is_ok(result)
+    update = result.value
+    assert isinstance(update, OpenPosition)
+    assert update.position.qty == Quantity(5)
+
+
+def test_AC20_result_is_a_new_object_and_input_position_is_unchanged() -> None:
+    """apply_fill must not mutate the `Position` passed in (N-7 immutability)."""
+    opened = apply_fill(None, _fill("f1", 7, "10"), _decision("dec-buy-1"), Side.buy, _NOW).value
+    original_position = opened.position
+
+    result = apply_fill(
+        original_position, _fill("f2", 3, "12"), _decision("dec-buy-2"), Side.buy, _NOW
+    )
+
+    assert is_ok(result)
+    update = result.value
+    assert isinstance(update, OpenPosition)
+    assert update.position is not original_position
+    assert original_position.qty == Quantity(7)
+    assert original_position.avg_cost == Price(Decimal("10"))
