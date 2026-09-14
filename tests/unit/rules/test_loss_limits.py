@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -143,3 +143,115 @@ def test_trading_week_start_on_monday_is_itself() -> None:
     now_utc = datetime(2026, 1, 12, 18, 0, tzinfo=UTC)
 
     assert trading_week_start(now_utc) == datetime(2026, 1, 12, tzinfo=UTC).date()
+
+
+def test_daily_loss_boundary_14_99_is_none() -> None:
+    limits = _limits()
+
+    breach = evaluate(
+        limits,
+        realized_today=Money(Decimal("-14.99")),
+        unrealized_now=Money(Decimal("0")),
+        realized_week=Money(Decimal("0")),
+        equity=Money(Decimal("500")),
+        peak_equity=Money(Decimal("500")),
+    )
+
+    assert breach is None
+
+
+def test_daily_loss_boundary_15_00_is_breach() -> None:
+    limits = _limits()
+
+    breach = evaluate(
+        limits,
+        realized_today=Money(Decimal("-15.00")),
+        unrealized_now=Money(Decimal("0")),
+        realized_week=Money(Decimal("0")),
+        equity=Money(Decimal("500")),
+        peak_equity=Money(Decimal("500")),
+    )
+
+    assert breach is not None
+    assert breach.kind == "daily"
+
+
+def test_weekly_loss_boundary_29_99_is_none() -> None:
+    limits = _limits()
+
+    breach = evaluate(
+        limits,
+        realized_today=Money(Decimal("0")),
+        unrealized_now=Money(Decimal("0")),
+        realized_week=Money(Decimal("-29.99")),
+        equity=Money(Decimal("500")),
+        peak_equity=Money(Decimal("500")),
+    )
+
+    assert breach is None
+
+
+def test_weekly_loss_boundary_30_00_is_breach() -> None:
+    limits = _limits()
+
+    breach = evaluate(
+        limits,
+        realized_today=Money(Decimal("0")),
+        unrealized_now=Money(Decimal("0")),
+        realized_week=Money(Decimal("-30.00")),
+        equity=Money(Decimal("500")),
+        peak_equity=Money(Decimal("500")),
+    )
+
+    assert breach is not None
+    assert breach.kind == "weekly"
+
+
+def test_drawdown_boundary_14_99_pct_is_none() -> None:
+    limits = _limits()
+
+    breach = evaluate(
+        limits,
+        realized_today=Money(Decimal("0")),
+        unrealized_now=Money(Decimal("0")),
+        realized_week=Money(Decimal("0")),
+        equity=Money(Decimal("425.05")),
+        peak_equity=Money(Decimal("500.00")),
+    )
+
+    assert breach is None
+
+
+def test_drawdown_boundary_15_00_pct_is_breach() -> None:
+    limits = _limits()
+
+    breach = evaluate(
+        limits,
+        realized_today=Money(Decimal("0")),
+        unrealized_now=Money(Decimal("0")),
+        realized_week=Money(Decimal("0")),
+        equity=Money(Decimal("425.00")),
+        peak_equity=Money(Decimal("500.00")),
+    )
+
+    assert breach is not None
+    assert breach.kind == "drawdown"
+
+
+def test_trading_day_matches_spec_example_utc_to_ny_monday() -> None:
+    # plan.md リスク 4 / tester instructions: UTC 2026-09-15T03:00 is NY
+    # 2026-09-14 (Monday); the week start is that same Monday.
+    now_utc = datetime(2026, 9, 15, 3, 0, tzinfo=UTC)
+
+    assert trading_day(now_utc) == date(2026, 9, 14)
+    assert trading_week_start(now_utc) == date(2026, 9, 14)
+
+
+def test_trading_week_start_crosses_utc_sunday_midnight_boundary() -> None:
+    # UTC Monday 01:00 is still Sunday 21:00 in New York (EDT, UTC-4), so it
+    # belongs to the *previous* week (Monday 2026-09-07), not the week that
+    # starts on the UTC-calendar Monday (2026-09-14).
+    now_utc = datetime(2026, 9, 14, 1, 0, tzinfo=UTC)
+
+    assert trading_day(now_utc) == date(2026, 9, 13)
+    assert trading_week_start(now_utc) == date(2026, 9, 7)

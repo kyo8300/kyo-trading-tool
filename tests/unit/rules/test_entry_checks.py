@@ -206,3 +206,175 @@ def test_accepted_candidate_yields_floor_share_count() -> None:
     assert plan.qty.shares == 7
     assert plan.notional == Money(Decimal("70.00"))
     assert plan.limit == Money(Decimal("75.00"))
+
+
+def test_excluded_ticker_wins_over_already_held_by_check_order() -> None:
+    # AC-11: when multiple rejection conditions hold at once, the plan's
+    # documented order (excluded -> already_held -> ...) decides which
+    # reason comes back, not an arbitrary one.
+    rules, limits = _rules_and_limits()
+    excluded_entry = rules.entry.model_copy(update={"excluded_tickers": ("AAPL",)})
+    rules = rules.model_copy(update={"entry": excluded_entry})
+
+    result = check_entry(
+        "AAPL",
+        rules,
+        limits,
+        holdings=("AAPL",),
+        market_open=True,
+        latest_price=Price(Decimal("10")),
+        avg_volume=500_000,
+        loss_state=None,
+    )
+
+    assert isinstance(result, Err)
+    assert result.error.code == "excluded_ticker"
+
+
+def test_price_equal_to_limit_buys_exactly_one_share() -> None:
+    rules, limits = _rules_and_limits()
+
+    result = check_entry(
+        "EDGE",
+        rules,
+        limits,
+        holdings=(),
+        market_open=True,
+        latest_price=Price(Decimal("75")),
+        avg_volume=500_000,
+        loss_state=None,
+    )
+
+    assert isinstance(result, Ok)
+    plan = result.value
+    assert plan.qty.shares == 1
+    assert plan.notional == Money(Decimal("75.00"))
+
+
+def test_price_slightly_over_limit_is_rejected() -> None:
+    rules, limits = _rules_and_limits()
+
+    result = check_entry(
+        "EDGE",
+        rules,
+        limits,
+        holdings=(),
+        market_open=True,
+        latest_price=Price(Decimal("75.01")),
+        avg_volume=500_000,
+        loss_state=None,
+    )
+
+    assert isinstance(result, Err)
+    assert result.error.code == "price_over_limit"
+
+
+def test_floor_share_count_leaves_a_fractional_remainder_unbought() -> None:
+    # $75 limit / $11 price = 6.81... shares -> floor to 6, notional 66.00,
+    # not a fractional or rounded-up share (spec "整数株の制約").
+    rules, limits = _rules_and_limits()
+
+    result = check_entry(
+        "FRAC",
+        rules,
+        limits,
+        holdings=(),
+        market_open=True,
+        latest_price=Price(Decimal("11")),
+        avg_volume=500_000,
+        loss_state=None,
+    )
+
+    assert isinstance(result, Ok)
+    plan = result.value
+    assert plan.qty.shares == 6
+    assert plan.notional == Money(Decimal("66.00"))
+
+
+def test_min_price_usd_boundary_exactly_two_is_accepted() -> None:
+    rules, limits = _rules_and_limits()
+
+    result = check_entry(
+        "MINP",
+        rules,
+        limits,
+        holdings=(),
+        market_open=True,
+        latest_price=Price(Decimal("2.00")),
+        avg_volume=500_000,
+        loss_state=None,
+    )
+
+    assert isinstance(result, Ok)
+
+
+def test_min_price_usd_boundary_just_below_two_is_rejected() -> None:
+    rules, limits = _rules_and_limits()
+
+    result = check_entry(
+        "MINP",
+        rules,
+        limits,
+        holdings=(),
+        market_open=True,
+        latest_price=Price(Decimal("1.9999")),
+        avg_volume=500_000,
+        loss_state=None,
+    )
+
+    assert isinstance(result, Err)
+    assert result.error.code == "min_price"
+
+
+def test_avg_volume_boundary_exactly_at_minimum_is_accepted() -> None:
+    rules, limits = _rules_and_limits()
+
+    result = check_entry(
+        "VOL",
+        rules,
+        limits,
+        holdings=(),
+        market_open=True,
+        latest_price=Price(Decimal("10")),
+        avg_volume=200_000,
+        loss_state=None,
+    )
+
+    assert isinstance(result, Ok)
+
+
+def test_avg_volume_boundary_one_below_minimum_is_rejected() -> None:
+    rules, limits = _rules_and_limits()
+
+    result = check_entry(
+        "VOL",
+        rules,
+        limits,
+        holdings=(),
+        market_open=True,
+        latest_price=Price(Decimal("10")),
+        avg_volume=199_999,
+        loss_state=None,
+    )
+
+    assert isinstance(result, Err)
+    assert result.error.code == "min_avg_volume"
+
+
+def test_price_over_limit_reason_includes_derived_amount_and_ratio() -> None:
+    rules, limits = _rules_and_limits()
+
+    result = check_entry(
+        "PRCY",
+        rules,
+        limits,
+        holdings=(),
+        market_open=True,
+        latest_price=Price(Decimal("80")),
+        avg_volume=500_000,
+        loss_state=None,
+    )
+
+    assert isinstance(result, Err)
+    assert "75.00" in result.error.reason
+    assert "15%" in result.error.reason

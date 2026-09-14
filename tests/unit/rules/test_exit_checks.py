@@ -156,3 +156,37 @@ def test_no_signal_when_no_condition_is_met() -> None:
     signal = check_exit(position, Price(Decimal("102")), rules, _NOW)
 
     assert signal is None
+
+
+def test_stop_loss_triggers_exactly_at_85_pct_of_avg_cost() -> None:
+    # stop_loss_pct = -15%, so avg_cost 100 * 0.85 = 85.00 exactly triggers.
+    rules = _rules()
+    position = _position(avg_cost=Price(Decimal("100")), partial_tp_done=False)
+
+    signal = check_exit(position, Price(Decimal("85.00")), rules, _NOW)
+
+    assert signal is not None
+    assert signal.reason == ExitReason.stop_loss
+
+
+def test_stop_loss_does_not_trigger_one_cent_above_the_boundary() -> None:
+    rules = _rules()
+    position = _position(avg_cost=Price(Decimal("100")), partial_tp_done=False)
+
+    signal = check_exit(position, Price(Decimal("85.01")), rules, _NOW)
+
+    assert signal is None
+
+
+def test_stop_loss_takes_priority_over_max_holding_days_when_both_hold() -> None:
+    rules = _rules()
+    position = _position(
+        avg_cost=Price(Decimal("100")),
+        opened_at=_NOW - timedelta(days=120),
+        partial_tp_done=False,
+    )
+
+    signal = check_exit(position, Price(Decimal("84")), rules, _NOW)
+
+    assert signal is not None
+    assert signal.reason == ExitReason.stop_loss
