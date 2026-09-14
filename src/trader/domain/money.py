@@ -113,8 +113,19 @@ class CanonicalDecimalError(ValueError):
 
 
 def from_canonical(value: str) -> Result[Decimal, CanonicalDecimalError]:
-    """Parse a canonical decimal string back into a `Decimal`."""
+    """Parse a canonical decimal string back into a `Decimal`.
+
+    Only plain (non-scientific) finite decimal strings -- the shape produced
+    by `to_canonical` -- are accepted. Decimal specials (`NaN`, `sNaN`,
+    `Infinity`, `-Infinity`) and scientific notation (e.g. `1e5`) are
+    rejected even though `decimal.Decimal` itself can parse them.
+    """
+    if "e" in value.lower():
+        return Err(CanonicalDecimalError(f"'{value}' is not a valid canonical decimal"))
     try:
-        return Ok(Decimal(value))
+        decimal_value = Decimal(value)
     except InvalidOperation:
         return Err(CanonicalDecimalError(f"'{value}' is not a valid canonical decimal"))
+    if not decimal_value.is_finite():
+        return Err(CanonicalDecimalError(f"'{value}' is not a valid canonical decimal"))
+    return Ok(decimal_value)
