@@ -162,6 +162,36 @@ def test_approve_with_a_non_utc_offset_expires_at_is_correctly_treated_as_expire
     conn.close()
 
 
+def test_approve_stores_expires_at_as_a_utc_terminated_string(tmp_path: Path) -> None:
+    """R-17: whatever offset `--expires-at` is supplied in, the stored
+    `approvals.expires_at` text is normalized to UTC (`to_utc`) before
+    persisting, so the raw column ends in `+00:00` or `Z`, not `+09:00`."""
+    db_path = tmp_path / "trader.sqlite3"
+    decision = _decision("dec-utc-text", db_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "approve",
+            decision.id,
+            "--expires-at",
+            "2026-01-06T06:00:00+09:00",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    conn = open_db(db_path).value
+    row = conn.execute(
+        "SELECT expires_at FROM approvals WHERE decision_id = ?", (decision.id,)
+    ).fetchone()
+    conn.close()
+    stored = row["expires_at"]
+    assert stored.endswith("+00:00") or stored.endswith("Z")
+    assert "+09:00" not in stored
+
+
 def test_status_reports_halted_positions_and_last_cycle(tmp_path: Path) -> None:
     from trader.domain.models import Position
     from trader.domain.money import Quantity

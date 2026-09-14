@@ -392,3 +392,81 @@ def test_partial_fill_delta_records_incremental_price_not_brokers_cumulative_avg
     position = portfolio_repo.get_position(conn, "ABCD")
     assert position is not None
     assert position.avg_cost.amount == Decimal("11.0000")
+
+
+def test_three_poll_partial_fill_deltas_each_get_their_own_incremental_price(conn) -> None:
+    """R-18: extends the two-poll case to three polls (3 -> 5 -> 7 shares,
+    broker cumulative average 10.00 -> 10.40 -> 11.00). Each poll's
+    incremental price must be derived from the delta against the *previous*
+    poll, not re-blended from the broker's running average, so `fills`
+    ends up with 3 rows priced 10.00 / 11.00 / 12.50 and the resulting
+    `positions.avg_cost` is exactly `11.0000`
+    ((3*10.00 + 2*11.00 + 2*12.50) / 7 = 77.00 / 7)."""
+
+    class _ThreeStepBroker:
+        def __init__(self) -> None:
+            self._responses = [
+                BrokerOrder(
+                    broker_order_id="b-2",
+                    client_order_id="order_dec-1",
+                    status=OrderStatus.partially_filled,
+                    filled_qty=Quantity(3),
+                    filled_avg_price=Price(Decimal("10.00")),
+                    updated_at=_NOW,
+                ),
+                BrokerOrder(
+                    broker_order_id="b-2",
+                    client_order_id="order_dec-1",
+                    status=OrderStatus.partially_filled,
+                    filled_qty=Quantity(5),
+                    filled_avg_price=Price(Decimal("10.40")),
+                    updated_at=_NOW,
+                ),
+                BrokerOrder(
+                    broker_order_id="b-2",
+                    client_order_id="order_dec-1",
+                    status=OrderStatus.filled,
+                    filled_qty=Quantity(7),
+                    filled_avg_price=Price(Decimal("11.00")),
+                    updated_at=_NOW,
+                ),
+            ]
+
+        def get_order(self, client_order_id: str):
+            return Ok(self._responses.pop(0))
+
+    order = _order("order-three-poll", "order_dec-1")
+    with transaction(conn):
+        repo.insert_order(conn, order)
+        repo.update_order_status(conn, "order-three-poll", OrderStatus.submitted)
+
+    decision = repo.get_decision(conn, "dec-1")
+
+    poll_result = poll_and_settle(
+        conn,
+        _ThreeStepBroker(),
+        FixedClock(_NOW),
+        lambda _s: None,
+        "order_dec-1",
+        "order-three-poll",
+        decision,
+        Side.buy,
+        None,
+        poll_timeout_s=10,
+        poll_interval_s=1,
+    )
+
+    assert isinstance(poll_result, Ok)
+    assert poll_result.value.fills_recorded == 3
+
+    fills = repo.list_fills(conn, "order-three-poll")
+    assert [f.qty.shares for f in fills] == [3, 2, 2]
+    assert [f.price.amount for f in fills] == [
+        Decimal("10.00"),
+        Decimal("11.00"),
+        Decimal("12.50"),
+    ]
+
+    position = portfolio_repo.get_position(conn, "ABCD")
+    assert position is not None
+    assert position.avg_cost.amount == Decimal("11.0000")

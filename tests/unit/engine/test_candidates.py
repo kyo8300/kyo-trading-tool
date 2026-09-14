@@ -157,6 +157,46 @@ def test_a_single_batch_of_buys_over_max_concurrent_positions_caps_passed_decisi
     conn.close()
 
 
+def test_three_already_held_plus_four_proposals_passes_only_two(tmp_path: Path) -> None:
+    """`held_tickers` seeded with 3 already-open positions (as `run_cycle`
+    passes in from the cycle-start snapshot) plus 4 new buy proposals in one
+    batch: only `max_concurrent_positions (5) - 3 = 2` can pass; the other 2
+    must be rejected for the concurrent-positions limit, since the running
+    `held_tickers` set must include both the pre-existing holdings and the
+    buys already accepted earlier in this same batch."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    tickers = ["EEEE", "FFFF", "GGGG", "HHHH"]
+    _insert_mentions(conn, tickers)
+
+    mentions = list_mentions(conn, "serenity")
+    result = evaluate_candidates(
+        conn,
+        mentions,
+        {"AAAA", "BBBB", "CCCC"},
+        _market(tickers),
+        _MultiBuyLlm(tickers=tickers),
+        rule_set,
+        limits,
+        FixedClock(_NOW),
+        "cycle-1",
+        sha256,
+        "paper",
+        None,
+        True,
+    )
+    assert isinstance(result, Ok)
+    decisions = result.value.decisions
+    passed = [d for d in decisions if d.rule_check.value == "passed"]
+    rejected_concurrent = [
+        d
+        for d in decisions
+        if d.rule_check.value == "rejected" and "concurrent" in d.rule_check_reason.lower()
+    ]
+    assert len(passed) == 2
+    assert len(rejected_concurrent) == 2
+    conn.close()
+
+
 def test_the_same_ticker_proposed_twice_in_one_batch_only_produces_one_passed_buy(
     tmp_path: Path,
 ) -> None:

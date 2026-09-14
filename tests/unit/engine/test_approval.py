@@ -252,3 +252,39 @@ def test_order_qty_of_zero_when_notional_is_below_reference_price_is_rejected(co
     )
     result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
     assert isinstance(result, Err)
+
+
+@pytest.mark.parametrize(
+    ("notional", "price", "expected_qty"),
+    [
+        (Decimal("75.00"), Decimal("10.0000"), 7),
+        (Decimal("58.33"), Decimal("8.3333"), 7),
+        (Decimal("74.00"), Decimal("2.0001"), 37),
+    ],
+)
+def test_order_qty_rounds_the_half_cent_quantization_error_without_inflating_shares(
+    conn, notional: Decimal, price: Decimal, expected_qty: int
+) -> None:
+    """R-12: `_order_qty` adds back half a cent before flooring so a
+    cent-quantized `proposed_notional` never under-counts the true share
+    count, but it must not round a boundary case up to an extra share
+    either (e.g. 75.00 / 10.0000 stays 7, not 8)."""
+    decision = _decision(
+        action=Action.sell,
+        proposed_notional=Money(notional),
+        reference_price=Price(price),
+    )
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Ok)
+    assert result.value.qty.shares == expected_qty
+
+
+def test_order_qty_of_9_99_over_10_still_floors_to_zero_not_one_share(conn) -> None:
+    """R-12 boundary: the half-cent correction must not turn a genuinely
+    sub-share notional (9.99 / 10 = 0.999 shares) into 1 share."""
+    decision = _decision(
+        proposed_notional=Money(Decimal("9.99")),
+        reference_price=Price(Decimal("10")),
+    )
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)

@@ -663,6 +663,78 @@ def test_a_held_positions_unpriceable_ticker_skips_the_cycle_instead_of_halting(
     conn.close()
 
 
+def test_priced_holdings_rule_exit_decision_survives_a_sibling_holdings_market_error(
+    tmp_path: Path,
+) -> None:
+    """R-13/R-19 エラー処理 (cycle.py comment "Holding decisions already
+    recorded above ... are kept"): with two held positions where only one
+    ticker's price is unavailable, `evaluate_holdings` still walks every
+    position in order, so a stop-loss `rule_exit` sell decision on the
+    *other*, correctly-priced ticker is inserted before the market error is
+    discovered. Fixing this implementation decision: the cycle still ends
+    `market_unavailable` (no equity_snapshots write, no new buys), but the
+    already-recorded sell decision on the priced ticker is not rolled back."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    opened_at = _NOW - timedelta(days=10)
+    # DOWN triggers stop_loss_pct=-15% at price 8.00 (avg_cost 10.00).
+    down_position = Position(
+        ticker="DOWN",
+        qty=Quantity(7),
+        avg_cost=Price(Decimal("10.00")),
+        opened_at=opened_at,
+        high_watermark=Price(Decimal("10.00")),
+        partial_tp_done=False,
+    )
+    # UNPRICED has no configured price -> market_errors.
+    unpriced_position = Position(
+        ticker="UNPRICED",
+        qty=Quantity(3),
+        avg_cost=Price(Decimal("10.00")),
+        opened_at=opened_at,
+        high_watermark=Price(Decimal("10.00")),
+        partial_tp_done=False,
+    )
+    assert isinstance(upsert_position(conn, down_position), Ok)
+    assert isinstance(upsert_position(conn, unpriced_position), Ok)
+
+    market = FakeMarketData(prices={"DOWN": Price(Decimal("8.00"))}, bars={}, clock=_OPEN_CLOCK)
+    broker = FakeBroker().with_account(
+        BrokerAccount(cash=Money(Decimal("10.00")), equity=Money(Decimal("10.00")))
+    )
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=None,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+    assert outcome.outcome == "market_unavailable"
+    assert outcome.orders == 0
+    assert list_equity_snapshots(conn) == ()
+
+    decisions = list_decisions(conn, outcome.cycle_id)
+    down_decisions = [d for d in decisions if d.ticker == "DOWN"]
+    assert len(down_decisions) == 1
+    assert down_decisions[0].action.value == "sell"
+    assert down_decisions[0].origin.value == "rule_exit"
+    conn.close()
+
+
 def test_multi_cycle_partial_take_profit_then_trailing_stop(tmp_path: Path) -> None:
     """R-21/AC-20/T-13 gap: a position that is partially taken-profit in one
     cycle and trailing-stopped out in a later cycle must close a single
