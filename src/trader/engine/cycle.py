@@ -148,9 +148,23 @@ def _finish(
 ) -> Result[CycleOutcome, CycleError]:
     finish_result = finish_cycle(conn, cycle_id, clock.now(), outcome, error_summary)
     if isinstance(finish_result, Err):
+        # Persist whatever writes (decisions, orders, fills, positions, ...)
+        # already succeeded this cycle even though the `cycles` row itself
+        # could not be closed out -- callers other than this connection
+        # (e.g. `trader report`/`trader status` in a later process) must see
+        # them, not silently lose them because this final write failed.
+        conn.commit()
         return Err(CycleError(finish_result.error.message))
     if outcome != "error":
         set_engine_state(conn, _LAST_CYCLE_ID_KEY, cycle_id)
+    # Every write this cycle (decisions/approvals/orders/fills/positions/
+    # trades/equity_snapshots/engine_state/cycles) shares this connection's
+    # single implicit transaction; only the `execute()` order-recording step
+    # calls `ledger.db.transaction()` (R-16) explicitly. Commit here so a
+    # fresh connection opened by another `trader` invocation (or the next
+    # `run-cycle`) actually observes this cycle's results (spec "SQLite の
+    # 同時実行": WAL readers only see committed data).
+    conn.commit()
     return Ok(
         CycleOutcome(
             cycle_id=cycle_id,
