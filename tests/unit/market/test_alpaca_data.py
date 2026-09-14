@@ -19,7 +19,7 @@ from trader.domain.money import Price
 from trader.domain.result import Err, Ok
 from trader.domain.retry import RetryPolicy
 from trader.market.alpaca_data import AlpacaMarketData
-from trader.market.data_provider import Bar, MarketClock
+from trader.market.data_provider import Bar, MarketClock, average_volume
 from trader.market.fake_data import FakeMarketData
 
 _RETRY_POLICY = RetryPolicy(max_attempts=3, base_delay_s=Decimal("0.5"), max_delay_s=Decimal("4"))
@@ -106,6 +106,56 @@ def test_daily_bars_gives_up_and_returns_err_after_max_attempts() -> None:
     assert "AAPL" not in result.error.message or "daily_bars" in result.error.message
 
 
+def test_latest_price_retries_and_succeeds_after_two_failures() -> None:
+    raw = {"AAPL": {"p": 12.5}}
+    flaky = _FlakyCall([RuntimeError("net"), RuntimeError("net"), raw])
+    sleeps: list[Decimal] = []
+
+    market = _market(data_client=_FakeDataClient(trade_call=flaky), sleep=sleeps.append)
+    result = market.latest_price("AAPL")
+
+    assert isinstance(result, Ok)
+    assert flaky.calls == 3
+    assert sleeps == [Decimal("0.5"), Decimal("1")]
+
+
+def test_latest_price_gives_up_and_returns_err_after_max_attempts() -> None:
+    flaky = _FlakyCall([RuntimeError("net"), RuntimeError("net"), RuntimeError("net")])
+
+    market = _market(data_client=_FakeDataClient(trade_call=flaky), sleep=lambda _delay: None)
+    result = market.latest_price("AAPL")
+
+    assert isinstance(result, Err)
+    assert flaky.calls == 3
+
+
+def test_market_clock_retries_and_succeeds_after_two_failures() -> None:
+    raw = {
+        "is_open": True,
+        "next_open": "2024-01-02T09:30:00+00:00",
+        "next_close": "2024-01-02T16:00:00+00:00",
+    }
+    flaky = _FlakyCall([RuntimeError("net"), RuntimeError("net"), raw])
+    sleeps: list[Decimal] = []
+
+    market = _market(trading_client=_FakeTradingClient(clock_call=flaky), sleep=sleeps.append)
+    result = market.market_clock()
+
+    assert isinstance(result, Ok)
+    assert flaky.calls == 3
+    assert sleeps == [Decimal("0.5"), Decimal("1")]
+
+
+def test_market_clock_gives_up_and_returns_err_after_max_attempts() -> None:
+    flaky = _FlakyCall([RuntimeError("net"), RuntimeError("net"), RuntimeError("net")])
+
+    market = _market(trading_client=_FakeTradingClient(clock_call=flaky), sleep=lambda _delay: None)
+    result = market.market_clock()
+
+    assert isinstance(result, Err)
+    assert flaky.calls == 3
+
+
 # --- response validation --------------------------------------------------
 
 
@@ -131,6 +181,27 @@ def test_daily_bars_rejects_missing_field_without_leaking_the_value() -> None:
     assert "c" in result.error.message
 
 
+def test_daily_bars_rejects_negative_volume_without_leaking_the_value() -> None:
+    raw = {"AAPL": [_raw_bar(v=-1.5)]}
+    market = _market(data_client=_FakeDataClient(bars_call=lambda request: raw))
+
+    result = market.daily_bars("AAPL")
+
+    assert isinstance(result, Err)
+    assert "-1.5" not in result.error.message
+
+
+def test_daily_bars_is_ok_with_an_empty_list_for_a_known_ticker() -> None:
+    """An empty bars list for a present ticker key is valid (e.g. no history yet)."""
+    raw: dict[str, Any] = {"AAPL": []}
+    market = _market(data_client=_FakeDataClient(bars_call=lambda request: raw))
+
+    result = market.daily_bars("AAPL")
+
+    assert isinstance(result, Ok)
+    assert result.value == ()
+
+
 def test_latest_price_rejects_non_positive_price() -> None:
     raw = {"AAPL": {"p": 0.0}}
     market = _market(data_client=_FakeDataClient(trade_call=lambda request: raw))
@@ -148,6 +219,25 @@ def test_latest_price_returns_price_on_valid_response() -> None:
 
     assert isinstance(result, Ok)
     assert result.value == Price(Decimal("12.5"))
+
+
+def test_latest_price_rejects_response_missing_the_ticker_key() -> None:
+    raw: dict[str, Any] = {}
+    market = _market(data_client=_FakeDataClient(trade_call=lambda request: raw))
+
+    result = market.latest_price("AAPL")
+
+    assert isinstance(result, Err)
+
+
+def test_latest_price_quantizes_via_decimal_str_to_four_places() -> None:
+    raw = {"AAPL": {"p": 10.123456}}
+    market = _market(data_client=_FakeDataClient(trade_call=lambda request: raw))
+
+    result = market.latest_price("AAPL")
+
+    assert isinstance(result, Ok)
+    assert result.value == Price(Decimal("10.1235"))
 
 
 # --- market clock ----------------------------------------------------------
@@ -182,6 +272,20 @@ def test_market_clock_rejects_naive_datetimes() -> None:
     result = market.market_clock()
 
     assert isinstance(result, Err)
+
+
+def test_market_clock_rejects_malformed_next_close_string() -> None:
+    raw = {
+        "is_open": True,
+        "next_open": "2024-01-02T09:30:00-05:00",
+        "next_close": "not-a-datetime",
+    }
+    market = _market(trading_client=_FakeTradingClient(clock_call=lambda: raw))
+
+    result = market.market_clock()
+
+    assert isinstance(result, Err)
+    assert "not-a-datetime" not in result.error.message
 
 
 # --- timeout wiring ----------------------------------------------------------
@@ -238,6 +342,38 @@ def test_create_wires_timeout_onto_the_injected_sdk_client_session() -> None:
     assert trading_client._session.calls[-1]["timeout"] == 17
 
 
+class _FakeSdkClientWithExplicitTimeout(_FakeSdkClient):
+    """Like `_FakeSdkClient`, but its own call already passes a `timeout`."""
+
+    def get_clock(self) -> dict[str, Any]:
+        self._session.request("GET", "/clock", timeout=99)
+        return {
+            "is_open": True,
+            "next_open": "2024-01-02T09:30:00+00:00",
+            "next_close": "2024-01-02T16:00:00+00:00",
+        }
+
+
+def test_create_does_not_override_a_timeout_the_caller_already_set() -> None:
+    """`_install_timeout` only fills in a default (`setdefault`); it must not
+    clobber a `timeout` the SDK call itself already supplied."""
+    market = AlpacaMarketData.create(
+        SecretStr("read-key"),
+        SecretStr("read-secret"),
+        mode=TradingMode.paper,
+        data_client_factory=_FakeSdkClientWithExplicitTimeout,
+        trading_client_factory=_FakeSdkClientWithExplicitTimeout,
+        sleep=lambda _delay: None,
+        timeout_s=17,
+    )
+
+    result = market.market_clock()
+
+    assert isinstance(result, Ok)
+    trading_client = market._trading_client
+    assert trading_client._session.calls[-1]["timeout"] == 99
+
+
 def test_create_does_not_leak_the_read_secret_into_client_kwargs_keys() -> None:
     market = AlpacaMarketData.create(
         SecretStr("read-key"),
@@ -251,6 +387,22 @@ def test_create_does_not_leak_the_read_secret_into_client_kwargs_keys() -> None:
     data_client = market._data_client
     assert data_client.init_kwargs["secret_key"] == "super-secret-value"  # noqa: S105
     assert data_client.init_kwargs["api_key"] == "read-key"
+
+
+def test_retry_err_message_does_not_contain_the_read_secret() -> None:
+    """Even if the underlying SDK exception happened to embed the secret in
+    its message, `_call_with_retry` only surfaces the exception's type name
+    (N-6) -- so a leaked secret in the exception text never reaches `Err`."""
+    secret = "super-secret-value"  # noqa: S105
+    flaky = _FlakyCall(
+        [RuntimeError(f"auth failed for key {secret}") for _ in range(3)],
+    )
+
+    market = _market(data_client=_FakeDataClient(bars_call=flaky), sleep=lambda _delay: None)
+    result = market.daily_bars("AAPL")
+
+    assert isinstance(result, Err)
+    assert secret not in result.error.message
 
 
 # --- FakeMarketData immutability -------------------------------------------
@@ -291,6 +443,10 @@ def test_fake_market_data_failing_forces_err_for_named_methods_only() -> None:
 
     assert isinstance(market.latest_price("AAPL"), Err)
     assert isinstance(market.daily_bars("AAPL"), Ok)
+
+
+def test_average_volume_of_empty_bars_is_zero() -> None:
+    assert average_volume(()) == 0
 
 
 def _bar() -> Bar:
