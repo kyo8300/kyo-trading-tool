@@ -1,11 +1,12 @@
 # Spec: ai-auto-trader
 
 - 元 intent: `specs/ai-auto-trader/intent.md`（approved_by: kyo, approved_at: 2026-09-14）
-- 作成日: 2026-09-13（改訂: 2026-09-14、kyo のレビュー反映）
+- 作成日: 2026-09-13（改訂: 2026-09-14、kyo のレビュー 2 回分を反映）
 - 状態: draft
 
-> **kyo へ**: 2026-09-14 のレビューを反映した。承認時に確定するものは末尾「kyo が承認時に確定するもの」の 4 つ
-> （技術スタック / 証券会社 / スコープ / 売買ルールの数値を変えるかどうか）。それ以外の「提案」は本改訂で決定として書き直した。
+> **kyo へ**: 2026-09-14 の回答（証券会社 (a) 確定 / 実弾 $2,000 は怖い）を反映した。売買ルールは**全て資金に対する割合**で定義し直し、
+> 資金額 `capital_usd` の既定を **$500** に下げた。作戦（比率）は資金額に依存しないので、kyo が決めるのは資金額だけでよい。
+> 承認時に確定するものは末尾「kyo が承認時に確定するもの」の 3 つ（技術スタック / スコープ / capital_usd の額とルール比率の変更有無）。
 > 技術スタックの確定後は `CLAUDE.md` の Commands を更新する。
 
 ## 概要
@@ -44,7 +45,7 @@ CLAUDE.md の Commands は未定。intent の制約（金額は Decimal/整数�
 | この用途への適合 | **高**。数値・データ・LLM が全部標準的な組み合わせ。個人ツールの規模に合う。候補 3 社すべてに公式 Python SDK がある | 中。UI を先に作るなら有利だが本 spec に UI は無い | 中。安全な並行処理は魅力だが本ツールは単一プロセスの定期実行で不要 |
 
 **推奨: A（Python 3.12 + uv + pytest + ruff + mypy strict + pydantic v2 + alpaca-py + anthropic）**。
-理由: 金額 Decimal が標準で、外部データ検証（pydantic）と LLM 構造化出力の相性が良く、証券会社候補 3 社すべてに公式 Python SDK がある（ブローカーをどれにしても言語を変えなくてよい）。
+理由: 金額 Decimal が標準で、外部データ検証（pydantic）と LLM 構造化出力の相性が良く、証券会社候補 3 社すべてに公式 Python SDK がある（live 移行時にブローカーを国内業者にしても言語を変えなくてよい）。
 kyo が承認時に確定する。確定後、`CLAUDE.md` の `## Commands` を以下に更新する（本 spec の verify コマンドはこれを前提にしている）:
 
 ```
@@ -54,7 +55,7 @@ kyo が承認時に確定する。確定後、`CLAUDE.md` の `## Commands` を�
 - Typecheck: uv run mypy src
 ```
 
-主要依存（バージョンは plan で固定）: `alpaca-py`（v1 を Alpaca で始める場合。moomoo なら `moomoo-api`）, `anthropic`, `pydantic>=2`, `pydantic-settings`, `typer`（CLI）, `pyyaml`（ルール定義）。
+主要依存（バージョンは plan で固定）: `alpaca-py`, `anthropic`, `pydantic>=2`, `pydantic-settings`, `typer`（CLI）, `pyyaml`（ルール定義）。
 DB は標準の `sqlite3`（単一ユーザー・単一プロセス。パラメータ化クエリのみ）。dev: `pytest`, `pytest-cov`, `ruff`, `mypy`, `respx`/`pytest-httpx` 相当のモック。
 
 ## 機能要件
@@ -75,27 +76,27 @@ DB は標準の `sqlite3`（単一ユーザー・単一プロセス。パラメ�
 
 ### 売買ルール（intent: 望む結果 3、制約「売買ルールは人間が決める」）
 
-- R-9: 売買ルールは `rules/trading-rules.yaml` に人間が書く。項目: 利確（部分利確 + トレーリング）、損切り、1 銘柄あたり上限金額、同時保有数上限、保有期間上限、1 日・1 週間の最大損失、口座全体の最大ドローダウン、取引対象外リスト。`approved_by` / `approved_at` を必須にする
+- R-9: 売買ルールは `rules/trading-rules.yaml` に人間が書く。項目: 運用資金 `capital_usd`、利確（部分利確 + トレーリング）、損切り、1 銘柄あたり上限（**capital に対する %**）、同時保有数上限、保有期間上限、1 日・1 週間の最大損失（**capital に対する %**）、口座全体の最大ドローダウン（%）、取引対象外リスト。`approved_by` / `approved_at` を必須にする。**金額の上限は全て `capital_usd × pct` から起動時に導出**し、YAML に絶対額は書かない（作戦 = 比率は資金額に依存せず、kyo が決めるのは資金額だけ）
 - R-10: ルールファイルの SHA-256 を `rules/trading-rules.lock` に記録し、起動時に一致を検証する。不一致（承認なしの変更）なら起動しない。lock の更新は kyo が `trader rules approve` を実行したときだけ行う
 - R-11: ルールはイミュータブルなオブジェクトとしてロードし、実行中に変更する API を持たない。LLM モジュールはルールファイルにも lock にも書き込めない（ファイルアクセスを持たない設計）
-- R-12: 買いの前に検証: 対象外銘柄でない / 同時保有数未満 / 1 銘柄上限金額以下 / 既に保有していない / 日次・週次・ドローダウンの損失上限に未到達 / 市場時間内
+- R-12: 買いの前に検証: 対象外銘柄でない / 同時保有数未満 / 1 銘柄上限（capital × `max_notional_per_ticker_pct`）以下 / 既に保有していない / 日次・週次・ドローダウンの損失上限に未到達 / 市場時間内
 - R-13: 保有中は毎サイクルで検証: 損切り価格到達 → 売り / 部分利確到達 → 一部売り / トレーリングストップ到達 → 残り売り / 保有期間上限到達 → 売り。売りは LLM の判断を待たない（ルールが優先）
 
 ### 発注・約定（intent: 望む結果 2、制約「paper から始め」「記録は必須」）
 
-- R-14: 証券会社は `Broker` インターフェースの背後に隠し、実装を差し替えられるようにする。**v1（段階 (1) paper）は Alpaca を推奨**し、初期実装は `AlpacaBroker` + テスト用 `FakeBroker`。段階 (2) の live 移行時に実口座を Alpaca / moomoo証券 / ウィブル証券のどれにするか決め直す（比較は「設計 > 証券会社の比較」、決定は kyo）。kyo が v1 から moomoo を選ぶ場合は `MoomooBroker` が初期実装になる（影響は同節に記載）
+- R-14: 証券会社は `Broker` インターフェースの背後に隠し、実装を差し替えられるようにする。**v1（段階 (1) paper）は Alpaca**（2026-09-14 kyo 確定）。初期実装は `AlpacaBroker` + テスト用 `FakeBroker`。段階 (2) の live 移行時に実口座を Alpaca / moomoo証券 / ウィブル証券のどれにするか決め直す（国内 2 社が本命。比較は「設計 > 証券会社の比較」）
 - R-15: 実行モードは `TRADER_MODE=paper|live`。省略時は `paper`。`live` は (a) `TRADER_MODE=live` (b) live 用キーが揃っている (c) `TRADER_LIVE_CONFIRM=I_ACCEPT_REAL_MONEY_RISK` の3つが揃わなければ起動を拒否する。テスト実行中（`TRADER_ENV=test`）は条件に関わらず `live` を拒否する
 - R-16: 注文は「判断レコード → 承認レコード → 注文レコード」の順で DB に**書き込み成功してから**ブローカーへ送信する。いずれかの書き込みに失敗したら送信しない（記録できない売買は実行しない）
 - R-17: 承認: `paper` モードでは `approver=system` の承認レコードを自動作成する。`live` モードでは kyo が `trader approve <decision_id>` を実行した承認レコードが無い注文は送信しない（段階 (2) の全件承認）。承認の有効期限は**次の市場セッション終了まで**（承認時刻が市場時間内ならその日の大引け、時間外なら翌営業日の大引け）。期限切れの承認では送信しない
 - R-18: 送信後、約定をポーリングして約定レコード（数量・約定価格・手数料・時刻）を保存する。部分約定・拒否・キャンセルも状態として記録する
-- R-19: 日次・週次の損失上限、または最高評価額からのドローダウン上限に達したら **キルスイッチ**: 未約定注文を全キャンセル、新規発注を停止、状態 `halted` を DB に永続化、理由をログと記録に残す。再開は kyo が `trader resume` を実行したときのみ。損失は実現損益 + 評価損益の合計で判定する
+- R-19: 日次・週次の損失上限（capital × pct）、または最高評価額からのドローダウン上限に達したら **キルスイッチ**: 未約定注文を全キャンセル、新規発注を停止、状態 `halted` を DB に永続化、理由をログと記録に残す。再開は kyo が `trader resume` を実行したときのみ。損失は実現損益 + 評価損益の合計で判定する
 
 ### 記録と成績（intent: 望む結果 4、Q10）
 
 - R-20: 全ての判断（採用・見送り・ルール拒否を含む）に、入力 evidence の参照、LLM モデル ID、プロンプトとレスポンスのハッシュ、ルール検証の結果、を紐づけて記録する
 - R-21: 各ポジションについて「何を根拠に買ったか / いつ・なぜ売ったか（どのルールが発火したか、または LLM 判断か）/ 損益」を1つの `trade` として閉じたときに記録する
 - R-22: `trader report` で成績を出力する: 期間損益、勝率、平均損益、最大ドローダウン、保有中ポジション、ルール発火回数、判断のうち採用・見送り・拒否の内訳
-- R-23: paper 成績には**実弾期待値の概算**を並べる: 想定スリッページ・手数料・為替コストを差し引いた損益（係数はルールファイルの `cost_assumptions`。初期値は本 spec で決定、ブローカー確定時に手数料項目だけ合わせる）
+- R-23: paper 成績には**実弾期待値の概算**を並べる: 想定スリッページ・手数料・為替コストを差し引いた損益（係数はルールファイルの `cost_assumptions`。初期値は本 spec で決定、live ブローカー確定時に手数料・為替の項目だけ合わせる）
 
 ### 運用（intent: 望む結果 5）
 
@@ -103,8 +104,8 @@ DB は標準の `sqlite3`（単一ユーザー・単一プロセス。パラメ�
 
 ## 非機能要件
 
-- N-1: **金額・株数・価格は `decimal.Decimal` のみ**。`src/` の domain / broker / ledger / rules 配下で `float` の型注釈・`float()` 呼び出し・`float` を返す関数を静的チェックで禁止する。DB には文字列（canonical decimal string）で保存する
-- N-2: **秘密情報は環境変数のみ**。名前を paper/live と read/trade で分ける: `ALPACA_PAPER_READ_KEY/SECRET`, `ALPACA_PAPER_TRADE_KEY/SECRET`, `ALPACA_LIVE_READ_KEY/SECRET`, `ALPACA_LIVE_TRADE_KEY/SECRET`, `ANTHROPIC_API_KEY`。起動時に現在のモードで必須の値だけを検証し、不足なら人間が読めるメッセージで終了する。ログ・エラー・記録に値を出さない（ブローカーを moomoo にする場合の変数名は「証券会社の比較」の注記を参照）
+- N-1: **金額・株数・価格は `decimal.Decimal` のみ**。`src/` の domain / broker / ledger / rules 配下で `float` の型注釈・`float()` 呼び出し・`float` を返す関数を静的チェックで禁止する。DB には文字列（canonical decimal string）で保存する。% から導出する絶対額も Decimal 演算で行い、最小単位（USD セント）に量子化する
+- N-2: **秘密情報は環境変数のみ**。名前を paper/live と read/trade で分ける: `ALPACA_PAPER_READ_KEY/SECRET`, `ALPACA_PAPER_TRADE_KEY/SECRET`, `ALPACA_LIVE_READ_KEY/SECRET`, `ALPACA_LIVE_TRADE_KEY/SECRET`, `ANTHROPIC_API_KEY`。起動時に現在のモードで必須の値だけを検証し、不足なら人間が読めるメッセージで終了する。ログ・エラー・記録に値を出さない
 - N-3: paper モードのプロセスは live のキーを**読まない**（Settings がモードに応じて存在するフィールドだけ持つ）。Alpaca の paper エンドポイントと live エンドポイントは URL レベルでも分け、`AlpacaBroker` はモードから決まる URL 以外を受け付けない
 - N-4: 外部 API 呼び出し（ブローカー取引・マーケットデータ・Anthropic）にはタイムアウト・リトライ（指数バックオフ、冪等な GET のみ）・レート制限を付ける。発注 POST は**リトライしない**（二重発注防止。`client_order_id` で冪等性を持たせる）
 - N-5: 外部データ（ブローカーレスポンス、LLM 出力、集約データ、環境変数、ルールファイル）は境界で pydantic 検証し、内部では検証済み型だけを扱う。`Any` は境界の受け口以外で禁止
@@ -124,7 +125,7 @@ kyo-trading-tool/
 ├── pyproject.toml                 # uv / ruff / mypy / pytest 設定
 ├── .env.example                   # 変数名だけ（値なし）
 ├── rules/
-│   ├── trading-rules.yaml         # 人間が書く売買ルール（初期値は下記）
+│   ├── trading-rules.yaml         # 人間が書く売買ルール（初期値は下記。比率のみ、絶対額なし）
 │   └── trading-rules.lock         # SHA-256 + approved_by/at（trader rules approve が生成）
 ├── data/sources/serenity/         # 手動コピーした yan-labs data/*.json（git 管理外）
 ├── var/                           # SQLite DB、ロックファイル、ログ（git 管理外）
@@ -134,7 +135,7 @@ kyo-trading-tool/
 │   │   ├── settings.py            # pydantic-settings。モード別の必須キー検証（N-2, N-3, R-15）
 │   │   └── mode.py                # TradingMode enum、live 起動条件の判定（純粋関数）
 │   ├── domain/                    # 型と純粋関数だけ。I/O なし
-│   │   ├── money.py               # Money/Price/Quantity（Decimal ラッパー、量子化規則）
+│   │   ├── money.py               # Money/Price/Quantity（Decimal ラッパー、量子化規則）、pct → 金額の導出関数
 │   │   ├── result.py              # Ok/Err
 │   │   ├── models.py              # Decision, Approval, Order, Fill, Position, Trade, Evidence, EquitySnapshot
 │   │   └── clock.py               # Clock プロトコル + SystemClock / FixedClock
@@ -148,11 +149,11 @@ kyo-trading-tool/
 │   │   ├── alpaca_data.py         # Alpaca Market Data API 実装
 │   │   └── fake_data.py           # テスト用
 │   ├── rules/                     # 売買ルール（R-9〜R-13）
-│   │   ├── schema.py              # RuleSet（frozen pydantic）と YAML ロード
+│   │   ├── schema.py              # RuleSet（frozen pydantic、比率のみ）と YAML ロード。DerivedLimits（capital × pct の絶対額）を生成
 │   │   ├── lock.py                # SHA-256 検証・lock 生成
-│   │   ├── entry_checks.py        # 買い前検証（R-12）→ Result
+│   │   ├── entry_checks.py        # 買い前検証（R-12）→ Result。上限額は DerivedLimits から受け取る
 │   │   ├── exit_checks.py         # 保有中の売り判定（R-13）→ ExitSignal | None
-│   │   └── loss_limits.py         # 日次/週次損失・最高評価額からのドローダウンの集計と判定（R-19）
+│   │   └── loss_limits.py         # 日次/週次損失（DerivedLimits の絶対額）・最高評価額からのドローダウンの集計と判定（R-19）
 │   ├── analysis/                  # LLM 判断（R-5〜R-7）
 │   │   ├── llm_client.py          # Anthropic 呼び出し（タイムアウト・リトライ）。プロンプト/レスポンスのハッシュ化
 │   │   ├── prompt.py              # プロンプト組み立て（ルールは読み取り専用テキストとして埋め込む）
@@ -189,8 +190,8 @@ kyo-trading-tool/
 |---|---|---|
 | `sources` | `source_id` PK, `name`, `imported_at`, `file_sha256`, `record_count` | 取り込み履歴 |
 | `mentions` | `id` PK, `source_id` FK, `external_id`（tweet id）, `ticker`, `posted_at`, `text_excerpt`, `url`, `raw_sha256` | 正規化した言及。1 ツイート複数銘柄なら複数行 |
-| `rule_sets` | `sha256` PK, `approved_by`, `approved_at`, `content_yaml` | `rules approve` のたびに追加。判断はこの sha を参照 |
-| `decisions` | `id` PK, `cycle_id`, `decided_at`, `mode`, `ticker`, `action`(`buy`/`sell`/`hold`/`skip`), `origin`(`llm`/`rule_exit`), `confidence`, `rationale`, `evidence_mention_ids` JSON, `llm_model`, `prompt_sha256`, `response_sha256`, `rule_set_sha256`, `rule_check`(`passed`/`rejected`), `rule_check_reason`, `proposed_notional`, `reference_price` | 見送り・拒否も記録 |
+| `rule_sets` | `sha256` PK, `approved_by`, `approved_at`, `capital_usd`, `content_yaml` | `rules approve` のたびに追加。判断はこの sha を参照。`capital_usd` を列に持つのは、report で「当時の資金額」に対する % 成績を出すため |
+| `decisions` | `id` PK, `cycle_id`, `decided_at`, `mode`, `ticker`, `action`(`buy`/`sell`/`hold`/`skip`), `origin`(`llm`/`rule_exit`), `confidence`, `rationale`, `evidence_mention_ids` JSON, `llm_model`, `prompt_sha256`, `response_sha256`, `rule_set_sha256`, `rule_check`(`passed`/`rejected`), `rule_check_reason`, `proposed_notional`, `reference_price` | 見送り・拒否も記録。`rule_check_reason` には導出した絶対額（例: `notional 80.00 > limit 75.00 (15% of 500)`）を含める |
 | `approvals` | `id` PK, `decision_id` FK, `approver`(`system`/`kyo`), `approved_at`, `expires_at` | live では `kyo` 必須。`expires_at` = 次の市場セッション終了 |
 | `orders` | `id` PK, `decision_id` FK, `approval_id` FK, `client_order_id` UNIQUE, `broker_order_id`, `mode`, `side`, `qty`, `order_type`, `status`(`recorded`/`submitted`/`partially_filled`/`filled`/`canceled`/`rejected`/`failed`), `submitted_at`, `last_error` | `recorded` の後に送信 |
 | `fills` | `id` PK, `order_id` FK, `filled_at`, `qty`, `price`, `fee` | 部分約定は複数行 |
@@ -206,19 +207,24 @@ kyo-trading-tool/
 
 ### ルール定義 `rules/trading-rules.yaml`（初期値。根拠付きで確定、kyo は承認時に数値を変更できる）
 
+**設計方針: 作戦（比率）は資金額に依存しない。資金額 `capital_usd` だけを kyo が決める。** 金額の上限（1 銘柄上限・日次/週次損失上限・DD 上限額）は
+YAML に書かず、起動時に `capital_usd × pct` から `DerivedLimits` として導出する。paper と live で同じ YAML を使えば、資金額を変えても比率は同じ作戦として比較できる。
+
 ```yaml
 approved_by: ""          # kyo が記入（trader rules approve 時に必須）
 approved_at: ""
 
-# 運用資金。paper でも live 予定額と同じ額にして、paper 成績と live 成績を同じ土俵で比較できるようにする。
-# kyo が下げる場合は position.max_notional_per_ticker_usd も比率（15%）で下げる（整数株しか買えないので、
-# 上限が低すぎると買える銘柄が減る）。
-capital_usd: "2000"
+# 運用資金（USD）。paper でも live 予定額と同じ額にして、paper 成績と live 成績を同じ土俵で比較できるようにする。
+# 既定 $500（約 7.5 万円）: 実弾で全額失っても生活に影響しない額、かつ 1 銘柄 15% = $75 で Serenity 銘柄（多くが $5〜$60）を
+# 整数株で買える下限付近。
+# kyo が承認時に変更できる。$300〜$1,000 の範囲なら以下の比率は変えなくてよい。$300 未満だと 1 銘柄 $45 未満になり
+# 買える銘柄が減るので、position.max_concurrent_positions を 3 に減らすことを推奨（1 銘柄 25% になる）。
+capital_usd: "500"
 
 position:
   # capital の 15%。5 銘柄で 75% 稼働、残り 25% は現金バッファ（スリッページ・端数・翌日の追加買いの余地）。
-  max_notional_per_ticker_usd: "300"
-  # 分散と資金効率の折衷。増やすと 1 銘柄あたりが小さくなり、$10〜$50 の銘柄が整数株で買えなくなる。
+  max_notional_per_ticker_pct: "15"
+  # 分散と資金効率の折衷。増やすと 1 銘柄あたりが小さくなり、整数株で買える銘柄が減る。
   max_concurrent_positions: 5
   # 永久塩漬け防止の上限。Serenity のテーゼは 6〜12 ヶ月だが、結果を計測するために期限で強制クローズして記録する。
   # 120 日 = 約 4 ヶ月 = テーゼ期間の下限の 2/3。paper の数週間で到達する想定ではなく、live での安全弁。
@@ -226,7 +232,7 @@ position:
 
 exit:
   # 対象銘柄は 1 日 15〜25% 動く。-8% 等の一般的な値はノイズで狩られる。-15% は「1 日の揺れの上限」に近く、
-  # それを超えたらテーゼ崩れとみなす水準。1 ポジションの最大損失 = $300 × 15% = $45 = capital の 2.25%。
+  # それを超えたらテーゼ崩れとみなす水準。1 ポジションの最大損失 = 1 銘柄上限 15% × 損切り 15% = capital の 2.25%。
   stop_loss_pct: "-15"
   # フォロワー殺到で急騰した分を半分確定し、残り半分でテーゼの 6〜12 ヶ月を追う。
   partial_take_profit_pct: "30"
@@ -236,14 +242,14 @@ exit:
   trailing_stop_pct: "20"
 
 loss_limits:
-  # capital の 3%。1 ポジションの損切り $45 + スリッページ ≒ 1 回の損切り。同日 2 回目の損切りで止まる
+  # capital の 3%。1 ポジションの損切り 2.25% + スリッページ ≒ 1 回の損切り。同日 2 回目の損切りで止まる
   # （「悪い日」に損切りが連鎖するのを防ぐ）。
-  max_daily_loss_usd: "60"
+  max_daily_loss_pct: "3"
   # capital の 6%。週に損切り 2〜3 回で止まる。
-  max_weekly_loss_usd: "120"
+  max_weekly_loss_pct: "6"
   # 口座全体の評価額（現金 + 保有評価額）が過去最高評価額から 15% 下がったら停止。
   # 日次・週次は「短期の連鎖」を止める基準、ドローダウンは「じわじわ負け続けている = 作戦が機能していない」を
-  # 止める基準で役割が違う。15% = 週次上限 6% の 2.5 週分。$2,000 なら $300。
+  # 止める基準で役割が違う。15% = 週次上限 6% の 2.5 週分。
   max_drawdown_pct: "15"
 
 entry:
@@ -252,7 +258,7 @@ entry:
   min_avg_daily_volume: 200000         # 直近 20 日平均の出来高（株）
   excluded_tickers: []
 
-# R-23 実弾期待値の係数（決定値。ブローカー確定時に commission_* だけ合わせる）
+# R-23 実弾期待値の係数（決定値。live ブローカー確定時に commission_* と fx_cost_pct_one_way を合わせる）
 cost_assumptions:
   # 小型株の成行注文の想定（片道）。entry.min_avg_daily_volume 20 万株が前提。
   slippage_pct_per_side: "0.5"
@@ -261,10 +267,30 @@ cost_assumptions:
   commission_cap_usd: ""               # 空 = 上限なし。moomoo なら "22"
   # 注文あたりの固定手数料。SEC/FINRA fee 等の実額は fills.fee に記録するのでここには含めない。
   commission_usd_per_order: "0"
-  # 入出金時の USD/JPY コスト（片道）。Alpaca（海外送金）は銀行の固定送金手数料 数千円 + 為替スプレッドを
-  # capital $2,000 で割ると 1〜2% 相当になるため保守的に "1.0"。国内業者（円入金）なら "0.25" に下げる。
+  # 入出金時の USD/JPY コスト（片道、概算）。
+  # - Alpaca（海外送金）: 銀行の固定送金手数料 数千円 + 為替スプレッド。capital $500 では固定手数料だけで 5% 以上に相当し、
+  #   成績を食う。live を Alpaca にするのはこの点でも不利で、国内業者（円入金）が本命。
+  # - 国内業者（円入金、為替スプレッド 25 銭/USD 程度）: 約 0.25%。
+  # 初期値は両者の間の保守的な "1.0" を置く（paper 段階の概算用）。live 業者が決まったら実コストに合わせる。
   fx_cost_pct_one_way: "1.0"
 ```
+
+**導出される絶対額（`DerivedLimits`。起動時に `capital_usd × pct` で計算、USD セントに量子化）**:
+
+| 項目 | 計算 | capital $500（既定） | capital $2,000（旧既定、参考） |
+|---|---|---|---|
+| 1 銘柄上限 | capital × 15% | $75.00 | $300.00 |
+| 損切り 1 回の最大損失 | 1 銘柄上限 × 15% | $11.25（= capital の 2.25%） | $45.00 |
+| 日次損失上限 | capital × 3% | $15.00 | $60.00 |
+| 週次損失上限 | capital × 6% | $30.00 | $120.00 |
+| ドローダウン上限額 | peak_equity × 15%（peak の初期値 = capital） | $75.00 | $300.00 |
+| 5 銘柄満杯時の稼働額 | 1 銘柄上限 × 5 | $375.00（現金バッファ $125） | $1,500.00 |
+
+`entry_checks` / `loss_limits` はこの `DerivedLimits` を受け取って判定し、`rule_check_reason` には導出額と元の比率の両方を書く（kyo が後から読んで検算できるように）。
+
+**整数株の制約**: v1 は**整数株のみ**。1 株の価格が 1 銘柄上限（$500 なら $75）を超える銘柄は `entry_checks` が「見送り」にする。
+Alpaca は端株（fractional）を成行で扱えるが、live 候補の国内業者は端株非対応なので、paper でも整数株に統一して paper / live の成績を比較可能にする。
+株数 = `floor(1 銘柄上限 / 現在値)`。
 
 **トレーリングストップとは**: 買値ではなく、**買ってから付けた最高値**を基準にする損切り。最高値から X% 下がったら売る。
 上がる間はストップ価格も一緒に上がる（下がることはない）ので、利益を伸ばしつつ、崩れたら利益を守れる。
@@ -276,7 +302,8 @@ $100 → $105 → $84 のように最高値をほとんど更新しないまま�
 **ドローダウン判定の計算**: 毎サイクル、`equity = cash + Σ(保有数量 × 現在値)` を `equity_snapshots` に upsert し、
 `peak_equity = max(前日までの peak_equity, equity)`、`drawdown_pct = (peak_equity − equity) / peak_equity × 100`。
 `drawdown_pct >= max_drawdown_pct` でキルスイッチ（R-19）。`resume` は `halted` を解除するだけで `peak_equity` はリセットしない
-（リセットすると「負け続けても毎回 15% ずつ許す」ことになる。kyo が意図的にリセットしたい場合はルールファイルの `capital_usd` を変えて `rules approve` する）。
+（リセットすると「負け続けても毎回 15% ずつ許す」ことになる。kyo が意図的にリセットしたい場合はルールファイルの `capital_usd` を変えて `rules approve` する。
+`capital_usd` を変えると `DerivedLimits` も全て再導出されるので、資金追加・減額の手続きはこれ 1 つに集約される）。
 
 ### データフロー
 
@@ -288,12 +315,12 @@ sources/serenity/adapter (pydantic 検証, fail fast) → ledger.mentions
    │  trader run-cycle（cron 15 分間隔、市場時間内）
    ▼
 engine/cycle:
-  1. settings 検証（モード・キー）／ rules lock 検証／ engine_state.halted なら判断のみで終了
+  1. settings 検証（モード・キー）／ rules lock 検証／ RuleSet → DerivedLimits 導出／ engine_state.halted なら判断のみで終了
   2. ledger から保有ポジション・当日/当週損益を取得、口座評価額を equity_snapshots に記録
-     → rules/loss_limits（日次・週次・ドローダウン）→ 到達なら kill_switch
+     → rules/loss_limits（日次・週次の導出額・ドローダウン %）→ 到達なら kill_switch
   3. 保有中: market data で現在値 → high_watermark 更新 → rules/exit_checks → ExitSignal なら decision(origin=rule_exit)
   4. 新規: sources/evidence（直近言及・新規言及銘柄）+ market data → analysis/analyst（LLM）→ Proposal
-     → rules/entry_checks → decision(rule_check=passed|rejected)
+     → rules/entry_checks（DerivedLimits）→ decision(rule_check=passed|rejected)
   5. passed な decision → engine/approval（paper: system 承認 / live: kyo 承認レコード要、期限内）
   6. engine/order_executor: ledger に order(status=recorded) を書く → 成功時のみ broker.submit
      → status=submitted → ポーリングで fills → positions/trades 更新
@@ -305,7 +332,7 @@ report/metrics + live_estimate → テキスト
 
 ### 証券会社の比較（R-14、Q2）
 
-kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券はどう？」への回答。intent 作成時点では「paper 環境が口座開設なしで今日から使え、公式 SDK が成熟している」ことだけで Alpaca を置いていた。国内 2 社を含めて比較し直す。
+kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券はどう？」への回答。intent 作成時点では「paper 環境が口座開設なしで今日から使え、公式 SDK が成熟している」ことだけで Alpaca を置いていた。国内 2 社を含めて比較し直した。
 
 | 軸 | Alpaca（米国） | ウィブル証券（Webull Japan） | moomoo証券（Japan） |
 |---|---|---|---|
@@ -315,31 +342,27 @@ kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券は
 | 認証キーの運用負荷 | 低。キーに期限なし（自分でローテーション） | **API Key の既定有効期限 45 日**。自動運用ではローテーション運用が必要（切れると cron が止まる） | OpenD にログイン（口座 + パスワード + 取引パスワード）。キー期限の制約は無いが常駐プロセスの監視が要る |
 | 利用開始手続き | paper: キー発行のみ。live: 口座開設（195+ カ国対応） | 口座開設 + OpenAPI 利用申請（審査あり）→ アプリ登録 → API Key 生成 | 口座開設 + OpenAPI 利用申請 |
 | 米国株手数料 | $0 | 要確認（約定代金の一定率、上限あり） | 約定代金 × 0.132%（税込）、上限 $22。API 利用は無料 |
-| 入金 | **海外送金**（銀行の送金手数料 数千円 + 為替スプレッド。$2,000 規模では固定手数料が 1〜2% 相当） | 円で入金可 | 円で入金可 |
+| 入金 | **海外送金**（銀行の送金手数料 数千円 + 為替スプレッド。**capital $500 では固定手数料だけで 5% 以上に相当**し、成績を食う） | 円で入金可 | 円で入金可 |
 | 税務 | 海外業者なので**特定口座なし → 確定申告を自分でやる** | 特定口座（源泉徴収）が使える | 特定口座（源泉徴収）が使える |
+| 端株（fractional） | 成行のみ対応（本 spec では使わない。整数株に統一） | 非対応 | 非対応 |
 | 対応商品 | 米国株・ETF・（暗号資産） | 米国株現物・信用・オプション（買い）、日本株現物 | 米国株（API）。バックテスト・リアルタイムデータ（気配・板・ティック）も API で取れる |
 | サポート | 英語 | 日本語 | 日本語 |
 | API 実績年数 | 長い（2018〜） | 約 2 年 | 半年 |
 
-**spec としての推奨**:
+**決定（2026-09-14 kyo）**:
 
-- **v1（段階 (1) paper）は Alpaca で始める**。理由: 今日から動かせる（口座開設・審査待ちなし）、paper = live 同一 API なので paper で検証したコードパスがそのまま live の土台になる（R-15〜R-17 のガードを同じコードで検証できる）、SDK が最も成熟している。
-- **段階 (2) の live 移行時に、実口座を Alpaca / moomoo / ウィブルのどれにするか決め直す**。国内 2 社は特定口座と円入金で個人には明確に有利（Alpaca は確定申告と海外送金コストが毎回かかる）なので、**live は国内業者が本命**。`Broker` インターフェースの背後に隠す設計（R-14）はそのためにある。live 移行時に `MoomooBroker` または `WebullBroker` を追加し、paper 成績の比較対象は Alpaca の記録をそのまま使う。
-- **代替案: v1 から moomoo で通す**。kyo が既に国内 2 社のどちらかに口座を持っている、または最初から 1 社で通したい（paper と live でブローカーを変えたくない）場合は、paper 対応が公式に明記されている moomoo を v1 に選ぶ。ウィブルは日本法人の OpenAPI で paper が使えるか未確認、かつ API Key 45 日期限が自動運用に不向きなので v1 には勧めない。
-  moomoo を v1 にした場合の本 spec への影響:
-  - 初期実装が `MoomooBroker`（+ `market/moomoo_data.py`）になり、**運用マシンに `OpenD` の常駐が v1 に入る**（起動確認を `trader status` に含める）。`alpaca-py` は依存から外れ `moomoo-api` に置き換わる
-  - N-2 の環境変数名が `MOOMOO_OPEND_HOST/PORT`, `MOOMOO_TRADE_PASSWORD`（暗号化済み）等に変わり、read/trade の分離は「相場データ接続と取引接続を別コネクションにし、取引パスワードは発注経路にだけ渡す」に読み替える。AC-30 の変数名リストも合わせて更新する
-  - AC-14 の「URL 分離テスト」は「OpenD の接続先と `TrdEnv`（SIMULATE / REAL）の分離。paper モードでは REAL を指定できない」に読み替える
-  - 口座開設 + OpenAPI 利用申請が先に必要なので、**申請が通るまで builder は `FakeBroker` でしか動かせない**（AC-32 の Deploy 後確認が遅れる）
+- **v1（段階 (1) paper）は Alpaca**。理由: 今日から動かせる（口座開設・審査待ちなし）、paper = live 同一 API なので paper で検証したコードパスがそのまま live の土台になる（R-15〜R-17 のガードを同じコードで検証できる）、SDK が最も成熟している。
+- **段階 (2) の live 移行時に、実口座を Alpaca / moomoo / ウィブルのどれにするか決め直す。国内 2 社が本命**。理由: 特定口座と円入金で個人には明確に有利。Alpaca は確定申告と海外送金コストが毎回かかり、capital $500 規模では入金コストが成績を食う。`Broker` インターフェースの背後に隠す設計（R-14）はそのためにある。live 移行時に `MoomooBroker` または `WebullBroker` を追加し、paper 成績の比較対象は Alpaca の記録をそのまま使う。
+- ウィブルを live にする場合の注意: 日本法人の OpenAPI で paper が使えるか未確認、API Key 45 日期限のローテーション運用が要る。moomoo にする場合の注意: `OpenD` 常駐プロセスの監視が要る。いずれも live 移行の spec で扱う。
 - IBKR は intent どおり差し替え候補として残すのみ（比較には含めない）。
 
-**決定は kyo**（末尾「kyo が承認時に確定するもの」2 番）。以降の設計・AC は Alpaca 前提で書いてあり、moomoo を選んだ場合は上記の読み替えを plan に反映する。
+以降の設計・AC は Alpaca 前提で書いてある。
 
 ### 外部インターフェース
 
 | 相手 | 用途 | 認証 | 備考 |
 |---|---|---|---|
-| Alpaca Trading API（paper: `paper-api.alpaca.markets` / live: `api.alpaca.markets`） | 発注・注文照会・ポジション・口座 | モード別の trade キー | 発注はリトライなし、`client_order_id` で冪等。fractional は成行のみなので**原則整数株**。1 株が上限金額を超える銘柄は見送り |
+| Alpaca Trading API（paper: `paper-api.alpaca.markets` / live: `api.alpaca.markets`） | 発注・注文照会・ポジション・口座 | モード別の trade キー | 発注はリトライなし、`client_order_id` で冪等。**整数株のみ**（Alpaca は端株を成行で扱えるが、live 候補の国内業者は端株非対応なので paper でも整数株に統一し、成績を比較可能にする）。1 株が 1 銘柄上限（capital × 15%）を超える銘柄は見送り |
 | Alpaca Market Data API | 日足・分足・最新気配・市場カレンダー | モード別の read キー | 無料の IEX フィードで開始（Q7）。足りなければ別プロバイダを `MarketDataProvider` の実装追加で対応 |
 | Anthropic API | 判断（構造化 JSON） | `ANTHROPIC_API_KEY` | temperature 低め、モデル ID は設定。ツール呼び出しは与えない（読み取り専用の入力だけ） |
 | yan-labs アーカイブ | 集約データ | なし（ファイル） | 手動コピー。ネットワーク取得はしない |
@@ -348,8 +371,8 @@ kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券は
 ### エラー処理
 
 - 各層は `Result` を返す。CLI が `Err` を人間向けメッセージ + exit code 非 0 に変換する
-- 起動時エラー（キー不足・lock 不一致・DB 不整合）は**何もせず終了**
-- サイクル内の部分失敗: LLM 失敗 → その銘柄は `skip` として記録し続行。マーケットデータ失敗 → 売り判定も評価額計算もできないので**新規買いをしない**（保有は次サイクルで再評価。`equity_snapshots` はその サイクルでは更新しない）。ブローカー送信失敗 → order を `failed` にして理由を記録、同一 `client_order_id` で再送はしない
+- 起動時エラー（キー不足・lock 不一致・DB 不整合・`capital_usd` が正の Decimal でない・pct が 0〜100 の範囲外）は**何もせず終了**
+- サイクル内の部分失敗: LLM 失敗 → その銘柄は `skip` として記録し続行。マーケットデータ失敗 → 売り判定も評価額計算もできないので**新規買いをしない**（保有は次サイクルで再評価。`equity_snapshots` はそのサイクルでは更新しない）。ブローカー送信失敗 → order を `failed` にして理由を記録、同一 `client_order_id` で再送はしない
 - DB 書き込み失敗 → 発注しない（R-16）。サイクルを `outcome=error` で終了
 - 例外は境界（外部 SDK 呼び出し）で捕捉して `Err` に変換する。空 `except` 禁止
 
@@ -364,13 +387,14 @@ kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券は
 
 - 段階 (3)(4): 「確実な条件は自動」の判定ロジック、承認不要の live 発注
 - live 口座の開設・入金・初回 live 発注の実施（土台は作るが、実施は paper 成績を見て kyo が別途判断）
-- live 用ブローカー実装の追加（`MoomooBroker` / `WebullBroker` / IBKR）。kyo が v1 から moomoo を選んだ場合のみ `MoomooBroker` がスコープに入り、代わりに `AlpacaBroker` が外れる
+- live 用ブローカー実装の追加（`MoomooBroker` / `WebullBroker` / IBKR）。live 移行の spec で扱う
 - 日本株、楽天証券
 - ニュース・決算の自動解析、Serenity 以外の情報源の実装（`SourceAdapter` の差し替え余地のみ）
 - 発信者の方法論・テーゼの自作、yan-labs の `references/*.md` や `SKILL.md` の取り込み（本 spec は `data/*.json` のみ）
 - 集約データの自動更新（yan-labs パイプライン停止時の自前取得、Q8）
 - Web UI・通知（Slack 等）。`report` はテキスト出力のみ
 - 指値・逆指値の注文種別（v1 は市場時間内の成行のみ。ルールによる売りはエンジン管理）
+- 端株（fractional）の発注
 - 為替の自動処理、税務計算
 
 ## 受入基準
@@ -397,8 +421,8 @@ kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券は
   verify: uv run pytest tests/unit/rules/test_lock.py -q
 - [ ] AC-10: ロードした RuleSet は frozen で、属性代入や LLM モジュール経由の変更が例外になる。`analysis/` 配下はルールファイル・lock への書き込みコードを含まない（R-11）
   verify: uv run pytest tests/unit/rules/test_immutable_rules.py -q && ! grep -rEn "open\(.*rules|trading-rules" src/trader/analysis/
-- [ ] AC-11: 買い前検証（対象外銘柄 / 同時保有数 / 1 銘柄上限 / 既保有 / 損失上限 / 市場時間）の各条件で拒否理由付きの Err が返る（R-12）
-  verify: uv run pytest tests/unit/rules/test_entry_checks.py -q
+- [ ] AC-11: 買い前検証（対象外銘柄 / 同時保有数 / 1 銘柄上限 = capital × pct / 既保有 / 損失上限 / 市場時間）の各条件で拒否理由付きの Err が返り、上限額が `capital_usd` と pct から Decimal で正しく導出される（capital $500 → 1 銘柄 $75.00、日次 $15.00、週次 $30.00）（R-9, R-12）
+  verify: uv run pytest tests/unit/rules/test_entry_checks.py tests/unit/rules/test_derived_limits.py -q
 - [ ] AC-12: 損切り・部分利確・トレーリングストップ・保有期間上限の各条件で正しい ExitSignal が返り、LLM を呼ばずに売り decision が作られる（R-13）
   verify: uv run pytest tests/unit/rules/test_exit_checks.py -q
 - [ ] AC-13: `TRADER_MODE` 省略時は paper。live は live キー + `TRADER_LIVE_CONFIRM` が揃わないと起動拒否。`TRADER_ENV=test` では条件が揃っても live を拒否する（R-15, N-2）
@@ -411,7 +435,7 @@ kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券は
   verify: uv run pytest tests/unit/engine/test_approval.py -q
 - [ ] AC-17: 約定ポーリングで filled / partially_filled / canceled / rejected が fills と orders.status に正しく記録される（R-18）
   verify: uv run pytest tests/unit/ledger/test_fills.py -q
-- [ ] AC-18: 日次・週次・ドローダウンのいずれかの損失が上限に達すると、未約定注文が全キャンセルされ、新規発注が停止し、`halted` が永続化され、`resume` まで次サイクルでも発注しない（R-19）
+- [ ] AC-18: 日次・週次（capital × pct の導出額）・ドローダウン（%）のいずれかの損失が上限に達すると、未約定注文が全キャンセルされ、新規発注が停止し、`halted` が永続化され、`resume` まで次サイクルでも発注しない（R-19）
   verify: uv run pytest tests/unit/engine/test_kill_switch.py -q
 - [ ] AC-19: 全 decision に evidence 参照・LLM モデル ID・プロンプト/レスポンスのハッシュ・rule_set_sha256・rule_check 結果が記録され、見送り・拒否も残る（R-20）
   verify: uv run pytest tests/unit/ledger/test_decision_record.py -q
@@ -425,13 +449,13 @@ kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券は
   verify: uv run python scripts/check_no_float_money.py
 - [ ] AC-24: 発注 POST はリトライされず、GET はバックオフ付きリトライされ、全外部呼び出しにタイムアウトがある（N-4）
   verify: uv run pytest tests/unit/broker/test_retry_policy.py tests/unit/analysis/test_llm_client.py -q
-- [ ] AC-25: Alpaca レスポンス・環境変数・ルール YAML の不正入力が境界で拒否され、人間が読めるメッセージ（キー値・スタックトレースを含まない）になる（N-5, N-6）
-  verify: uv run pytest tests/unit/config/test_settings_validation.py tests/unit/broker/test_response_validation.py -q
+- [ ] AC-25: Alpaca レスポンス・環境変数・ルール YAML の不正入力（絶対額キー `*_usd` の混入、pct の範囲外、`capital_usd` が非正を含む）が境界で拒否され、人間が読めるメッセージ（キー値・スタックトレースを含まない）になる（N-5, N-6）
+  verify: uv run pytest tests/unit/config/test_settings_validation.py tests/unit/broker/test_response_validation.py tests/unit/rules/test_schema_validation.py -q
 - [ ] AC-26: domain モデルは全て frozen で、属性代入が例外になる（N-7）
   verify: uv run pytest tests/unit/domain/test_immutability.py -q
 - [ ] AC-27: `src/` 配下に 800 行を超えるファイルがない（N-8）
   verify: ! find src -name '*.py' -exec awk 'END{if(NR>800){print FILENAME; exit 1}}' {} \; | grep -q .
-- [ ] AC-28: 統合テスト: FakeBroker + 実 SQLite で ingest → run-cycle（買い）→ 価格更新 → run-cycle（損切り売り）→ report まで一気通貫で動き、trade が 1 件記録される（R-8, R-24）
+- [ ] AC-28: 統合テスト: FakeBroker + 実 SQLite で ingest → run-cycle（買い、capital $500 で整数株）→ 価格更新 → run-cycle（損切り売り）→ report まで一気通貫で動き、trade が 1 件記録される（R-8, R-24）
   verify: uv run pytest tests/integration/test_paper_cycle.py -q
 - [ ] AC-29: CLI サブコマンド `ingest / run-cycle / approve / report / rules approve / resume / status` が存在し `--help` が exit 0 で返る（R-24）
   verify: for c in ingest run-cycle approve report "rules approve" resume status; do uv run trader $c --help >/dev/null || exit 1; done
@@ -447,15 +471,15 @@ kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券は
 ## 未解決の問い（intent から引き継ぎ・ここで解いたもの）
 
 - Q1: yan-labs の導入方法 → **解決**: `npx skills add` / `skills update` は使わない（第三者 CLI の安全性未確認、自己更新指示は「内容をレビューなしで差し替えない」制約に反する）。`data/aleabitoreddit_tweets.json` と `ticker_stats.txt` だけを `data/sources/serenity/` に手動コピーし、スキーマ検証して取り込む。`SKILL.md` と `references/*.md` は取り込まない（方法論はプロンプトに人間が要約して入れる運用。本 spec では扱わない）。ライセンス未設定のため再配布しない（git 管理外）
-- Q2: 証券会社 → **比較を「設計 > 証券会社の比較」に記載、選択は kyo**。spec の推奨は「v1（paper）は Alpaca、段階 (2) の live 移行時に Alpaca / moomoo / ウィブルから決め直す（国内 2 社が本命）」。代替案として「v1 から moomoo で通す」も併記（paper 対応が明記されている。ウィブルは paper 未確認 + API Key 45 日期限のため v1 には勧めない）。Alpaca を live で使う場合の注意: 海外送金の入金コスト（$2,000 規模で 1〜2% 相当）と特定口座なし（確定申告が必要）。IBKR は `Broker` 差し替え余地として残す
-- Q3: 売買ルール → **初期値を根拠付きで確定（「ルール定義」の YAML コメント参照）。kyo は承認時に数値を変更できる**。要点: capital $2,000 / 1 銘柄 $300（15%）/ 同時 5 / 損切り -15%（1 ポジション最大損失 $45 = 2.25%）/ 部分利確 +30% で半分 / 残りにトレーリング -20% / 保有上限 120 日 / 日次 -$60（3%）週次 -$120（6%）/ **口座全体ドローダウン -15%（kyo の指摘で追加）**。paper の記録で「損切り発火回数」「ドローダウン推移」を見て調整する
+- Q2: 証券会社 → **解決（2026-09-14 kyo 確定）**: v1（paper）は Alpaca、段階 (2) の live 移行時に Alpaca / moomoo / ウィブルから決め直す（国内 2 社が本命）。比較は「設計 > 証券会社の比較」。Alpaca を live で使う場合の注意: 海外送金の入金コスト（capital $500 規模では固定手数料だけで 5% 以上に相当）と特定口座なし（確定申告が必要）。IBKR は `Broker` 差し替え余地として残す
+- Q3: 売買ルール → **初期値を根拠付きで確定（「ルール定義」の YAML コメント参照）。全て資金に対する割合で定義し、kyo は承認時に `capital_usd` と比率を変更できる**。要点: capital 既定 $500（実弾で失っても生活に影響しない額）/ 1 銘柄 15%（$75）/ 同時 5 / 損切り -15%（1 ポジション最大損失 = capital の 2.25% = $11.25）/ 部分利確 +30% で半分 / 残りにトレーリング -20% / 保有上限 120 日 / 日次 -3%（$15）週次 -6%（$30）/ 口座全体ドローダウン -15%（$75）。整数株のみ。paper の記録で「損切り発火回数」「ドローダウン推移」「1 株が上限超えで見送った回数」を見て調整する
 - Q4: AI の判断根拠 → **plan で prompt.py の具体に落とす**: evidence として「直近 14 日の新規言及銘柄」「言及回数の増減」「直近の言及抜粋」を渡し、株価データとして「直近 20 日の日足」「出来高平均」を渡す。買いのトリガーは LLM に任せるが、見送り条件（既保有・上限・対象外・流動性）はルールで機械判定。重み付けはデータが溜まるまで固定しない
 - Q5: 段階移行条件 → **方向性を確定（実装は別 spec）**: paper → 少額実弾は「paper 3 週間以上 + 閉じた trade 10 件以上 + 実弾期待値がプラス + 最大 DD が weekly 上限未満 + キルスイッチが誤作動していない」。的中率の確定を待たない
 - Q6: 「確実」の機械判定 → **引き続き未解決（段階 (3) の spec で決める）**。本 spec は decision に `origin` / `confidence` / `rule_check` を残すので、後から条件別の成績を集計できる
-- Q7: 株価データ → **解決**: Alpaca Market Data API（無料 IEX フィード）で開始。日足・分足・最新気配・市場カレンダーが取れれば v1 は足りる。`MarketDataProvider` の実装追加で差し替え可能（moomoo を選んだ場合は moomoo の相場 API）
+- Q7: 株価データ → **解決**: Alpaca Market Data API（無料 IEX フィード）で開始。日足・分足・最新気配・市場カレンダーが取れれば v1 は足りる。`MarketDataProvider` の実装追加で差し替え可能（live 移行時に国内業者にする場合はその相場 API）
 - Q8: 集約データの更新 → **引き続き未解決（運用で決める）**: v1 は手動コピーの再取り込み（`ingest` は冪等。`external_id` で重複排除）。自前取得はスコープ外
 - Q9: 発信者の追加基準 → **引き続き未解決（運用で決める）**。提案: 「構造化アーカイブが存在する / 監査済み / 6 ヶ月以上の実績」。`SourceAdapter` 追加で対応
-- Q10: 実弾期待値 → **解決**: R-23。`実弾期待値 = paper 損益 − Σ(約定金額 × slippage_pct_per_side) − Σ min(約定金額 × commission_pct, commission_cap_usd) − 注文数 × commission_usd_per_order − capital × fx_cost_pct_one_way × 2` を report に並べる。係数は `cost_assumptions` に決定値を記載（slippage 0.5% / commission は Alpaca 前提で 0、ブローカー確定時に合わせる / fx 1.0%（Alpaca・海外送金前提。国内業者なら 0.25%））
+- Q10: 実弾期待値 → **解決**: R-23。`実弾期待値 = paper 損益 − Σ(約定金額 × slippage_pct_per_side) − Σ min(約定金額 × commission_pct, commission_cap_usd) − 注文数 × commission_usd_per_order − capital × fx_cost_pct_one_way × 2` を report に並べる。係数は `cost_assumptions` に決定値を記載（slippage 0.5% / commission は Alpaca 前提で 0 / fx は保守的に 1.0%。live 業者確定時に合わせる: 国内業者なら fx 0.25%、Alpaca なら $500 規模で 5% 以上）
 
 ### 確定事項（2026-09-14 kyo 回答）
 
@@ -463,13 +487,14 @@ kyo の問い「Alpaca にした経緯は？ウィブル証券・moomoo証券は
 - `run-cycle` の実行間隔: 市場時間内 15 分（R-8, N-10）
 - Q5 の移行条件の方向性: 上記のとおり
 - cost_assumptions の値: AI が決定（Q10）
+- 証券会社: (a) v1 は Alpaca、live 移行時に決め直す（国内 2 社が本命）（R-14, Q2）
+- 資金: 実弾 $2,000 は怖い → ルールを比率で定義し直し、`capital_usd` 既定を $500 に変更（Q3）
 
 ### kyo が承認時に確定するもの（まとめ）
 
 1. 技術スタック: Python 3.12 + uv（推奨 A）
-2. 証券会社: **(a) v1 は Alpaca で始め、live 移行時に Alpaca / moomoo / ウィブルから決め直す（spec 推奨）** / **(b) v1 から moomoo で通す**（「証券会社の比較」の読み替えを plan に反映）
-3. スコープ: 段階 (1) 完成 + 段階 (2) の土台まで
-4. 売買ルールの数値（変更したければ。変更しなければ「ルール定義」の初期値で `rules approve` する）
+2. スコープ: 段階 (1) 完成 + 段階 (2) の土台まで
+3. `capital_usd` の額（既定 $500。$300〜$1,000 なら比率はそのままでよい）と、ルール比率を変えるかどうか（変えなければ「ルール定義」の初期値で `rules approve` する）
 
 ## 承認
 
