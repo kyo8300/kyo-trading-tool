@@ -26,7 +26,12 @@ def test_help_exits_zero(args: list[str]) -> None:
     assert result.exit_code == 0, result.output
 
 
-def test_ingest_without_args_reports_not_implemented() -> None:
+def test_ingest_without_a_data_dir_reports_a_human_readable_error() -> None:
+    # T-7 replaced the stub body with a real implementation (see
+    # tests/unit/sources/test_serenity_adapter.py for full coverage). With
+    # no --data-dir and no data/sources/serenity/ present, it should fail
+    # with a human-readable message rather than a stack trace.
     result = runner.invoke(app, ["ingest"])
     assert result.exit_code == 1
-    assert "not implemented" in result.output
+    assert "not implemented" not in result.output
+    assert "trader ingest:" in result.output

@@ -11,10 +11,18 @@ T-12, T-13, T-14) replace the bodies with real behavior.
 
 from __future__ import annotations
 
+import hashlib
 import os
+import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
+
+if TYPE_CHECKING:
+    from trader.domain.result import Result
+    from trader.sources import AdapterRegistry
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 rules_app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -26,10 +34,135 @@ def _not_implemented(command: str) -> None:
     raise typer.Exit(code=1)
 
 
+_DEFAULT_SOURCES_DIR = "data/sources"
+_DEFAULT_RULES_PATH = "rules/trading-rules.yaml"
+_DEFAULT_DB_PATH = "var/trader.sqlite3"
+
+
+def _compute_data_dir_sha256(data_dir: Path) -> str:
+    """Fingerprint the contents of `data_dir` for ingest idempotency.
+
+    Prefers the well-known `tweets.json` file (R-1's serenity layout); falls
+    back to hashing every regular file's name + content so other adapters
+    (e.g. a test double with no `tweets.json`) still get a stable, content-
+    sensitive fingerprint.
+    """
+    tweets_file = data_dir / "tweets.json"
+    if tweets_file.is_file():
+        return hashlib.sha256(tweets_file.read_bytes()).hexdigest()
+
+    hasher = hashlib.sha256()
+    if data_dir.is_dir():
+        for path in sorted(data_dir.glob("*")):
+            if path.is_file():
+                hasher.update(path.name.encode("utf-8"))
+                hasher.update(path.read_bytes())
+    return hasher.hexdigest()
+
+
+class _IngestWriteError(RuntimeError):
+    """Raised inside the ingest transaction to trigger a rollback."""
+
+
+def run_ingest(
+    registry: AdapterRegistry,
+    source_id: str,
+    data_dir: Path,
+    db_path: Path,
+    now: datetime,
+) -> Result[str, str]:
+    """Load `source_id`'s data via `registry`, then record it in the ledger.
+
+    Returns `Ok(message)` on success (including the idempotent "unchanged"
+    case) and `Err(message)` on any failure. Neither message contains a
+    filesystem path or raw record data (N-6). The DB is never touched if
+    loading/validating the source data fails.
+    """
+    from trader.domain.result import Err, Ok
+    from trader.ledger.db import open_db, transaction
+    from trader.ledger.source_repository import get_source, insert_mentions_many, upsert_source
+
+    adapter_result = registry.get(source_id)
+    if isinstance(adapter_result, Err):
+        return Err(adapter_result.error.message)
+    adapter = adapter_result.value
+
+    load_result = adapter.load(data_dir)
+    if isinstance(load_result, Err):
+        error = load_result.error
+        if error.first_errors:
+            detail = "; ".join(error.first_errors)
+            return Err(f"{error.message}: {detail}")
+        return Err(error.message)
+    mentions = load_result.value
+
+    file_sha256 = _compute_data_dir_sha256(data_dir)
+
+    db_result = open_db(db_path)
+    if isinstance(db_result, Err):
+        return Err(db_result.error.message)
+    conn = db_result.value
+
+    try:
+        existing = get_source(conn, source_id)
+        if existing is not None and existing["file_sha256"] == file_sha256:
+            return Ok("変更なし")
+
+        try:
+            with transaction(conn) as tx:
+                upsert_result = upsert_source(
+                    tx,
+                    source_id=source_id,
+                    name=source_id,
+                    imported_at=now,
+                    file_sha256=file_sha256,
+                    record_count=len(mentions),
+                )
+                if isinstance(upsert_result, Err):
+                    raise _IngestWriteError(upsert_result.error.message)
+
+                insert_result = insert_mentions_many(tx, mentions)
+                if isinstance(insert_result, Err):
+                    raise _IngestWriteError(insert_result.error.message)
+                inserted = insert_result.value
+        except (_IngestWriteError, sqlite3.Error) as exc:
+            return Err(str(exc))
+    finally:
+        conn.close()
+
+    return Ok(f"{len(mentions)} 件取り込み(新規 {inserted} 件)")
+
+
 @app.command("ingest")
-def ingest() -> None:
+def ingest(
+    source: str = typer.Option("serenity", "--source", help="Source id to ingest"),
+    data_dir: str | None = typer.Option(
+        None,
+        "--data-dir",
+        help="Directory holding the source's files (default: data/sources/<source>)",
+    ),
+    db: str | None = typer.Option(
+        None, "--db", help="Path to the ledger database (default: $TRADER_DB_PATH)"
+    ),
+) -> None:
     """Import aggregated data (e.g. serenity tweets.json) into the ledger."""
-    _not_implemented("ingest")
+    from trader.domain.result import Err
+    from trader.sources import default_registry
+
+    data_dir_path = Path(data_dir) if data_dir else Path(_DEFAULT_SOURCES_DIR) / source
+    db_path = Path(db or os.environ.get("TRADER_DB_PATH", _DEFAULT_DB_PATH))
+
+    result = run_ingest(
+        registry=default_registry(),
+        source_id=source,
+        data_dir=data_dir_path,
+        db_path=db_path,
+        now=datetime.now(UTC),
+    )
+    if isinstance(result, Err):
+        typer.echo(f"trader ingest: {result.error}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(f"trader ingest: {result.value}")
 
 
 @app.command("run-cycle")
@@ -48,10 +181,6 @@ def approve(decision_id: str = typer.Argument(..., help="Decision id to approve"
 def report() -> None:
     """Print performance report."""
     _not_implemented("report")
-
-
-_DEFAULT_RULES_PATH = "rules/trading-rules.yaml"
-_DEFAULT_DB_PATH = "var/trader.sqlite3"
 
 
 @rules_app.command("approve")
