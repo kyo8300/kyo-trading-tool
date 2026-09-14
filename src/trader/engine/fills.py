@@ -12,13 +12,14 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime
 from decimal import Decimal
 
 from trader.broker.broker import Broker
 from trader.domain.clock import Clock
 from trader.domain.models import Decision, ExitReason, Fill, OrderStatus, Side
-from trader.domain.money import Money, Quantity
+from trader.domain.money import Money, Price, Quantity
 from trader.domain.result import Err, Ok, Result
 from trader.ledger.portfolio_repository import (
     delete_position,
@@ -26,10 +27,16 @@ from trader.ledger.portfolio_repository import (
     insert_trade,
     upsert_position,
 )
-from trader.ledger.repository import insert_fill, update_order_status
+from trader.ledger.repository import (
+    FillContext,
+    insert_fill,
+    list_fill_context_for_ticker_since,
+    update_order_status,
+)
 from trader.ledger.trade_closer import OpenPosition, apply_fill
 
 _TERMINAL_STATUSES = frozenset({OrderStatus.filled, OrderStatus.canceled, OrderStatus.rejected})
+_ZERO_MONEY = Money(Decimal(0))
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +54,76 @@ class PollOutcome:
     final_status: OrderStatus
 
 
+@dataclass(frozen=True, slots=True)
+class _ReplayState:
+    """The running entry decision / accumulated exit decisions / realized
+    P&L and fees for an open position, as rebuilt from its prior fills."""
+
+    entry_decision_id: str | None
+    exit_decision_ids: tuple[str, ...]
+    realized_so_far: Money
+    fees_so_far: Money
+    qty: int
+    avg_cost: Price | None
+
+
+_EMPTY_REPLAY_STATE = _ReplayState(
+    entry_decision_id=None,
+    exit_decision_ids=(),
+    realized_so_far=_ZERO_MONEY,
+    fees_so_far=_ZERO_MONEY,
+    qty=0,
+    avg_cost=None,
+)
+
+
+def _replay_buy(state: _ReplayState, ctx: FillContext) -> _ReplayState:
+    if state.avg_cost is None:
+        return replace(
+            state,
+            entry_decision_id=ctx.decision_id,
+            qty=ctx.fill.qty.shares,
+            avg_cost=ctx.fill.price,
+        )
+    total_shares = state.qty + ctx.fill.qty.shares
+    new_avg_cost = Price(
+        (state.avg_cost.amount * state.qty + ctx.fill.price.amount * ctx.fill.qty.shares)
+        / Decimal(total_shares)
+    )
+    return replace(state, qty=total_shares, avg_cost=new_avg_cost)
+
+
+def _replay_sell(state: _ReplayState, ctx: FillContext) -> _ReplayState:
+    avg_cost = state.avg_cost if state.avg_cost is not None else Price(Decimal(0))
+    fill_pnl = Money((ctx.fill.price.amount - avg_cost.amount) * ctx.fill.qty.shares) - ctx.fill.fee
+    return replace(
+        state,
+        exit_decision_ids=(*state.exit_decision_ids, ctx.decision_id),
+        realized_so_far=state.realized_so_far + fill_pnl,
+        fees_so_far=state.fees_so_far + ctx.fill.fee,
+        qty=state.qty - ctx.fill.qty.shares,
+    )
+
+
+def _replay_prior_fills(
+    conn: sqlite3.Connection, ticker: str, opened_at: datetime, exclude_fill_id: str
+) -> _ReplayState:
+    """Rebuild the entry decision, accumulated exit decisions, and
+    accumulated realized P&L/fees for the currently open position on
+    `ticker` by replaying, in order, every fill recorded since it opened
+    (excluding `exclude_fill_id`, the fill about to be settled by the
+    caller). `positions` has no columns for this bookkeeping (R-21, see
+    `ledger.trade_closer` module docstring), so it must be rebuilt from the
+    fill history on every settlement instead of carried across `run_cycle`
+    calls in memory."""
+    state = _EMPTY_REPLAY_STATE
+    for ctx in list_fill_context_for_ticker_since(conn, ticker, opened_at):
+        if ctx.fill.id == exclude_fill_id:
+            continue
+        state = _replay_buy(state, ctx) if ctx.side is Side.buy else _replay_sell(state, ctx)
+    return state
+
+
 def _settle_fill(
     conn: sqlite3.Connection,
     decision: Decision,
@@ -55,7 +132,29 @@ def _settle_fill(
     exit_reason: ExitReason | None,
 ) -> Result[None, FillsError]:
     position = get_position(conn, decision.ticker)
-    result = apply_fill(position, fill, decision, side, fill.filled_at, exit_reason)
+    if side is Side.sell and position is not None:
+        replay = _replay_prior_fills(conn, decision.ticker, position.opened_at, fill.id)
+        entry_decision_id = replay.entry_decision_id
+        exit_decision_ids = replay.exit_decision_ids
+        realized_so_far = replay.realized_so_far
+        fees_so_far = replay.fees_so_far
+    else:
+        entry_decision_id = None
+        exit_decision_ids = ()
+        realized_so_far = _ZERO_MONEY
+        fees_so_far = _ZERO_MONEY
+    result = apply_fill(
+        position,
+        fill,
+        decision,
+        side,
+        fill.filled_at,
+        exit_reason,
+        entry_decision_id=entry_decision_id,
+        exit_decision_ids=exit_decision_ids,
+        realized_so_far=realized_so_far,
+        fees_so_far=fees_so_far,
+    )
     if isinstance(result, Err):
         return Err(FillsError(str(result.error)))
     update = result.value

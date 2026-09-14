@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
@@ -350,3 +351,54 @@ def list_all_fills(conn: sqlite3.Connection) -> tuple[Fill, ...]:
     """Return every fill across every order, oldest first (T-14 report: live-estimate costs)."""
     rows = conn.execute("SELECT * FROM fills ORDER BY filled_at ASC").fetchall()
     return tuple(_row_to_fill(row) for row in rows)
+
+
+@dataclass(frozen=True, slots=True)
+class FillContext:
+    """A `Fill` paired with its order's side and originating decision id.
+
+    Used to replay a position's fill history across multiple `run_cycle`
+    calls, since `positions` itself has no columns for the running entry
+    decision, accumulated exit decisions, or accumulated realized P&L (R-21,
+    see `ledger.trade_closer` module docstring).
+    """
+
+    fill: Fill
+    side: Side
+    decision_id: str
+
+
+def list_fill_context_for_ticker_since(
+    conn: sqlite3.Connection, ticker: str, since: datetime
+) -> tuple[FillContext, ...]:
+    """Return every fill for `ticker` at or after `since`, oldest first, each
+    paired with its order's side and originating decision id (R-21, T-13)."""
+    rows = conn.execute(
+        """
+        SELECT fills.id AS fill_id, fills.order_id AS fill_order_id,
+               fills.filled_at AS fill_filled_at, fills.qty AS fill_qty,
+               fills.price AS fill_price, fills.fee AS fill_fee,
+               orders.side AS order_side, orders.decision_id AS order_decision_id
+        FROM fills
+        JOIN orders ON orders.id = fills.order_id
+        JOIN decisions ON decisions.id = orders.decision_id
+        WHERE decisions.ticker = ? AND fills.filled_at >= ?
+        ORDER BY fills.filled_at ASC
+        """,
+        (ticker, _dt_to_text(since)),
+    ).fetchall()
+    return tuple(
+        FillContext(
+            fill=Fill(
+                id=row["fill_id"],
+                order_id=row["fill_order_id"],
+                filled_at=_dt_from_text(row["fill_filled_at"]),
+                qty=_quantity_or_raise(row["fill_qty"]),
+                price=_price_or_none(row["fill_price"]) or Price(Decimal(0)),
+                fee=_money_or_none(row["fill_fee"]) or Money(Decimal(0)),
+            ),
+            side=Side(row["order_side"]),
+            decision_id=row["order_decision_id"],
+        )
+        for row in rows
+    )
