@@ -19,11 +19,13 @@ from __future__ import annotations
 
 import fcntl
 import json
+import sqlite3
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from trader.analysis.llm_client import LlmError
@@ -840,6 +842,156 @@ def test_cycles_table_records_one_row_and_updates_last_cycle_id(tmp_path: Path) 
 
     assert get_engine_state(conn, "last_cycle_id") == outcome.cycle_id
     conn.close()
+
+
+def test_run_cycle_writes_are_visible_through_a_fresh_connection(tmp_path: Path) -> None:
+    """T-15: `_finish` commits the connection so that a second, independent
+    connection opened after `run_cycle` returns (as `trader report`/`trader
+    status`/the next `run-cycle` process would do) observes every write this
+    cycle made: positions, fills, orders.status, trades, cycles, and
+    engine_state.last_cycle_id (spec 'SQLite の同時実行': WAL readers only
+    see committed data)."""
+    db_path = tmp_path / "trader.sqlite3"
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+
+    opened_at = _NOW - timedelta(days=10)
+    position = Position(
+        ticker="ZZZZ",
+        qty=Quantity(7),
+        avg_cost=Price(Decimal("10.00")),
+        opened_at=opened_at,
+        high_watermark=Price(Decimal("10.00")),
+        partial_tp_done=False,
+    )
+    assert isinstance(upsert_position(conn, position), Ok)
+
+    market = FakeMarketData(prices={"ZZZZ": Price(Decimal("8.00"))}, bars={}, clock=_OPEN_CLOCK)
+    broker = _ImmediateFillBroker(fill_price=Price(Decimal("8.00")))
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=None,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+    assert isinstance(result, Ok)
+    outcome = result.value
+    conn.close()
+
+    # Open a brand new connection, as another `trader` process would.
+    fresh = open_db(db_path).value
+    try:
+        assert list_positions(fresh) == ()
+
+        trades = list_trades(fresh)
+        assert len(trades) == 1
+        assert trades[0].ticker == "ZZZZ"
+        assert trades[0].realized_pnl.amount == Decimal("-14.00")
+
+        order_rows = fresh.execute("SELECT status FROM orders").fetchall()
+        assert len(order_rows) == 1
+        assert order_rows[0]["status"] == "filled"
+
+        fill_rows = fresh.execute("SELECT qty, price FROM fills").fetchall()
+        assert len(fill_rows) == 1
+
+        cycle_rows = fresh.execute(
+            "SELECT id, finished_at, outcome FROM cycles WHERE id = ?", (outcome.cycle_id,)
+        ).fetchall()
+        assert len(cycle_rows) == 1
+        assert cycle_rows[0]["finished_at"] is not None
+        assert cycle_rows[0]["outcome"] == "ok"
+
+        assert get_engine_state(fresh, "last_cycle_id") == outcome.cycle_id
+    finally:
+        fresh.close()
+
+
+class _FailOnCyclesUpdate(sqlite3.Connection):
+    """A `sqlite3.Connection` whose `UPDATE cycles ...` statement (the one
+    `finish_cycle` issues) always raises, simulating a real DB exception at
+    the point `_finish` closes out the cycle row. Every other statement
+    behaves normally, so the cycle's actual writes (decisions, equity
+    snapshot, engine_state) still happen for real, exercising `finish_cycle`'s
+    own `except sqlite3.Error` -> `Err(LedgerError(...))` conversion."""
+
+    def execute(self, sql: str, *parameters: object) -> sqlite3.Cursor:
+        if sql.strip().startswith("UPDATE cycles"):
+            raise sqlite3.OperationalError("simulated disk I/O error")
+        return super().execute(sql, *parameters)
+
+
+def test_db_exception_during_finish_yields_err_and_is_not_swallowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T-15 (Prove-It): a genuine DB exception raised while closing out the
+    cycle (`finish_cycle`'s `UPDATE cycles`) must not be swallowed or crash
+    the caller uncaught. `finish_cycle` catches `sqlite3.Error` and returns
+    `Err(LedgerError)`; `_finish` must propagate that as `Err(CycleError)`
+    from `run_cycle` (N-6: no bare `except`, no silent `Ok`) while still
+    committing the writes that already happened this cycle (equity snapshot,
+    decisions -- spec 'DB 書き込み失敗' error handling)."""
+    db_path = tmp_path / "trader.sqlite3"
+    real_connect = sqlite3.connect
+
+    def _connect(path: object, *args: object, **kwargs: object) -> sqlite3.Connection:
+        kwargs.pop("factory", None)
+        return real_connect(path, *args, factory=_FailOnCyclesUpdate, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(sqlite3, "connect", _connect)
+
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+
+    market = FakeMarketData(prices={}, bars={}, clock=_OPEN_CLOCK)
+    broker = FakeBroker()
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=None,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Err), (
+        "a DB exception while finishing the cycle must surface as Err, not be "
+        "swallowed into a false Ok"
+    )
+    assert "could not finish cycle" in result.error.message
+
+    # The equity snapshot upserted earlier in this same cycle must still be
+    # committed even though the final `UPDATE cycles` failed.
+    snapshots = list_equity_snapshots(conn)
+    assert len(snapshots) == 1
+    conn.close()
+
+    # A fresh connection (real sqlite3.connect, not the failing factory)
+    # confirms the partial writes were actually committed, not lost.
+    monkeypatch.undo()
+    fresh = open_db(db_path).value
+    try:
+        assert len(list_equity_snapshots(fresh)) == 1
+    finally:
+        fresh.close()
 
 
 def test_run_cycle_cli_refuses_to_run_under_trader_env_test() -> None:
