@@ -186,6 +186,43 @@ def test_resume_when_halted_clears_state(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_report_shows_a_closed_trade(tmp_path: Path) -> None:
+    from trader.domain.models import ExitReason, Trade
+
+    db_path = tmp_path / "trader.sqlite3"
+    rules_path = Path(__file__).parent.parent / "fixtures" / "rules" / "valid.yaml"
+    decision = _decision("dec-report", db_path)
+
+    conn = open_db(db_path).value
+    with transaction(conn):
+        portfolio_repo.insert_trade(
+            conn,
+            Trade(
+                id="dec-report:dec-report-exit",
+                ticker="ABCD",
+                opened_at=_NOW,
+                closed_at=_NOW,
+                entry_decision_id=decision.id,
+                exit_decision_ids=("dec-report-exit",),
+                exit_reason=ExitReason.stop_loss,
+                realized_pnl=Money(Decimal("-14.00")),
+                fees=Money(Decimal("0")),
+                holding_days=3,
+            ),
+        )
+    conn.close()
+
+    result = runner.invoke(
+        app,
+        ["report", "--db", str(db_path), "--rules", str(rules_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "ABCD" in result.output
+    assert "-14.00" in result.output
+    assert "stop_loss" in result.output
+
+
 def test_resume_when_not_halted_reports_not_halted_without_erroring(tmp_path: Path) -> None:
     db_path = tmp_path / "trader.sqlite3"
     open_db(db_path).value.close()

@@ -22,6 +22,7 @@ import typer
 
 if TYPE_CHECKING:
     from trader.domain.result import Result
+    from trader.report import Period
     from trader.sources import AdapterRegistry
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -237,10 +238,109 @@ def approve(
     )
 
 
+def _date_in_period(value: datetime, period: Period) -> bool:
+    """Return whether `value`'s date falls within `period`."""
+    day = value.date()
+    if period.start is not None and day < period.start:
+        return False
+    if period.end is not None and day > period.end:
+        return False
+    return True
+
+
 @app.command("report")
-def report() -> None:
-    """Print performance report."""
-    _not_implemented("report")
+def report(
+    db: str | None = typer.Option(
+        None, "--db", help="Path to the ledger database (default: $TRADER_DB_PATH)"
+    ),
+    rules: str | None = typer.Option(
+        None, "--rules", help="Path to trading-rules.yaml (default: $TRADER_RULES_PATH)"
+    ),
+    from_: str | None = typer.Option(
+        None, "--from", help="Report period start date, YYYY-MM-DD (default: unbounded)"
+    ),
+    to: str | None = typer.Option(
+        None, "--to", help="Report period end date, YYYY-MM-DD (default: unbounded)"
+    ),
+) -> None:
+    """Print the performance report: metrics (R-22) and live estimate (R-23)."""
+    from datetime import date as date_cls
+
+    from trader.domain.money import Money
+    from trader.domain.result import Err
+    from trader.ledger.db import open_db
+    from trader.ledger.portfolio_repository import (
+        list_equity_snapshots,
+        list_positions,
+        list_trades,
+    )
+    from trader.ledger.repository import list_all_fills, list_decisions, list_orders
+    from trader.report import Period, compute, estimate, filter_trades_by_period, render_report
+    from trader.rules import load_rules
+
+    rules_path = Path(rules or os.environ.get("TRADER_RULES_PATH", _DEFAULT_RULES_PATH))
+    db_path = Path(db or os.environ.get("TRADER_DB_PATH", _DEFAULT_DB_PATH))
+
+    if not db_path.exists():
+        typer.echo("trader report: no database found (run 'trader ingest' first)", err=True)
+        raise typer.Exit(code=1)
+
+    rules_result = load_rules(rules_path)
+    if isinstance(rules_result, Err):
+        typer.echo(f"trader report: {rules_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    rule_set = rules_result.value
+
+    try:
+        period_start = date_cls.fromisoformat(from_) if from_ else None
+        period_end = date_cls.fromisoformat(to) if to else None
+    except ValueError:
+        typer.echo("trader report: --from/--to must be YYYY-MM-DD", err=True)
+        raise typer.Exit(code=1) from None
+    period = Period(start=period_start, end=period_end)
+
+    db_result = open_db(db_path)
+    if isinstance(db_result, Err):
+        typer.echo(f"trader report: {db_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    conn = db_result.value
+
+    try:
+        trades = list_trades(conn)
+        decisions = list_decisions(conn)
+        snapshots = list_equity_snapshots(conn)
+        positions = list_positions(conn)
+
+        metrics = compute(trades, decisions, snapshots, positions, period)
+
+        fills = tuple(
+            fill for fill in list_all_fills(conn) if _date_in_period(fill.filled_at, period)
+        )
+        order_count = sum(
+            1
+            for order in list_orders(conn)
+            if order.submitted_at is not None and _date_in_period(order.submitted_at, period)
+        )
+
+        live_estimate = estimate(
+            paper_pnl=metrics.period_pnl,
+            fills=fills,
+            order_count=order_count,
+            capital=Money(rule_set.capital_usd),
+            cost=rule_set.cost_assumptions,
+        )
+
+        period_trades = filter_trades_by_period(trades, period)
+        entry_decision_ids = {t.entry_decision_id for t in period_trades}
+        entry_decisions = {
+            decision.id: decision for decision in decisions if decision.id in entry_decision_ids
+        }
+
+        output = render_report(metrics, live_estimate, period_trades, entry_decisions, period)
+    finally:
+        conn.close()
+
+    typer.echo(output)
 
 
 @rules_app.command("approve")

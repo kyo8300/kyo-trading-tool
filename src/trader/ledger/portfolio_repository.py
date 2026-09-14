@@ -13,7 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import cast
 
-from trader.domain.models import ExitReason, Position, Trade
+from trader.domain.models import EquitySnapshot, ExitReason, Position, Trade
 from trader.domain.money import Money, Price, Quantity, from_canonical, to_canonical
 from trader.domain.result import Err, Ok, Result
 from trader.ledger.db import LedgerError
@@ -204,6 +204,25 @@ def upsert_equity_snapshot(
     except sqlite3.Error as exc:
         return Err(LedgerError(f"could not upsert equity snapshot: {exc}"))
     return Ok(None)
+
+
+def _row_to_equity_snapshot(row: sqlite3.Row) -> EquitySnapshot:
+    return EquitySnapshot(
+        snapshot_date=row["snapshot_date"],
+        mode=row["mode"],
+        cash=Money(_decimal_or_raise(row["cash"])),
+        positions_value=Money(_decimal_or_raise(row["positions_value"])),
+        equity=Money(_decimal_or_raise(row["equity"])),
+        peak_equity=Money(_decimal_or_raise(row["peak_equity"])),
+        drawdown_pct=_decimal_or_raise(row["drawdown_pct"]),
+        taken_at=_dt_from_text(row["taken_at"]),
+    )
+
+
+def list_equity_snapshots(conn: sqlite3.Connection) -> tuple[EquitySnapshot, ...]:
+    """Return every equity snapshot, oldest first (T-14 report: max drawdown)."""
+    rows = conn.execute("SELECT * FROM equity_snapshots ORDER BY snapshot_date ASC").fetchall()
+    return tuple(_row_to_equity_snapshot(row) for row in rows)
 
 
 # --- engine state ----------------------------------------------------------

@@ -336,3 +336,17 @@ def get_decision(conn: sqlite3.Connection, decision_id: str) -> Decision | None:
     """Return the decision with `decision_id`, or `None` if it does not exist."""
     row = conn.execute("SELECT * FROM decisions WHERE id = ?", (decision_id,)).fetchone()
     return _row_to_decision(row) if row is not None else None
+
+
+def list_orders(conn: sqlite3.Connection) -> tuple[Order, ...]:
+    """Return every order, oldest first (T-14 report: live-estimate order count)."""
+    rows = conn.execute(
+        "SELECT * FROM orders ORDER BY COALESCE(submitted_at, '') ASC, id ASC"
+    ).fetchall()
+    return tuple(_row_to_order(row) for row in rows)
+
+
+def list_all_fills(conn: sqlite3.Connection) -> tuple[Fill, ...]:
+    """Return every fill across every order, oldest first (T-14 report: live-estimate costs)."""
+    rows = conn.execute("SELECT * FROM fills ORDER BY filled_at ASC").fetchall()
+    return tuple(_row_to_fill(row) for row in rows)
