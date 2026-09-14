@@ -6,19 +6,30 @@
 
 ## 概要
 
-個人用トレーディングツール。技術スタックは**未定**で、最初の `/spec` の設計セクションで決定する。
-決定後は本ファイルの `## Commands` と `## Conventions` を更新すること。
+個人用トレーディングツール（AI が集約データを読み、人間が決めた売買ルールの中で米株を売買する。詳細は `specs/ai-auto-trader/spec.md`）。
+技術スタックは `specs/ai-auto-trader/spec.md` で決定済み: **Python 3.12 + uv + pytest + ruff + mypy(strict) + pydantic v2 + alpaca-py + anthropic + sqlite3**。
 
 ## Commands
 
-<!-- TODO: 最初の /spec でスタック決定後に更新する。Stop hook (verify-spec.sh) はここではなく spec.md の verify: を実行する -->
+<!-- Stop hook (verify-spec.sh) はここではなく spec.md の verify: を実行する。ここは人間とエージェントが手で回すコマンド -->
 
-- Build: `TODO`
-- Test: `TODO`（unit）/ `TODO`（integration）
-- Lint: `TODO`
-- Typecheck: `TODO`
+- Build: `uv sync`
+- Test: `uv run pytest tests/unit -q`（unit）/ `uv run pytest tests/integration -q`（integration）
+- Lint: `uv run ruff check . && uv run ruff format --check .`
+- Typecheck: `uv run mypy src`
+- テスト実行時は `TRADER_ENV=test` が強制され、実ネットワークに出ない（spec N-9）
 
-正常時の出力例は決定後にここへ貼る（エージェントが「通った」を判断する基準になる）。
+正常時の出力例（builder/tester が「通った」を判断する基準。初回の実装後に実際の出力へ差し替える）:
+
+```
+$ uv run ruff check . && uv run ruff format --check .
+All checks passed!
+N files already formatted
+$ uv run mypy src
+Success: no issues found in N source files
+$ uv run pytest tests/unit -q
+N passed in X.XXs
+```
 
 ## Conventions
 
