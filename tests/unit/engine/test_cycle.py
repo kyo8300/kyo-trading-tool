@@ -241,6 +241,74 @@ def test_normal_cycle_buys_and_fills(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_normal_cycle_executes_both_a_holdings_sell_and_a_candidate_buy(tmp_path: Path) -> None:
+    """R-13 (_execute_passed_decisions refactor, cycle.py:_run_locked/
+    _evaluate_risk split): when `market_errors` is empty (every held ticker
+    priced fine), the combined `all_decisions = (*holdings_outcome.decisions,
+    *candidates_outcome.decisions)` tuple must still submit and fill *both*
+    a rule-exit sell on an existing holding and an LLM-approved buy on a new
+    candidate in the same cycle -- the refactor that split `_evaluate_risk`
+    out and changed `_execute_passed_decisions`'s signature to take a plain
+    `decisions` tuple instead of the two outcome objects must not have
+    dropped either side."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    opened_at = _NOW - timedelta(days=10)
+    position = Position(
+        ticker="ZZZZ",
+        qty=Quantity(7),
+        avg_cost=Price(Decimal("10.00")),
+        opened_at=opened_at,
+        high_watermark=Price(Decimal("10.00")),
+        partial_tp_done=False,
+    )
+    assert isinstance(upsert_position(conn, position), Ok)
+
+    market = FakeMarketData(
+        prices={"ZZZZ": Price(Decimal("8.00")), "AAPL": Price(Decimal("10"))},
+        bars={"AAPL": _bars("AAPL")},
+        clock=_OPEN_CLOCK,
+    )
+    broker = _ImmediateFillBroker(fill_price=Price(Decimal("10")))
+    llm = _FakeLlm(ticker="AAPL")
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+    assert outcome.outcome == "ok"
+    assert outcome.orders == 2
+    assert outcome.fills == 2
+
+    submitted_tickers = {req.ticker for req in broker.submitted}
+    assert submitted_tickers == {"ZZZZ", "AAPL"}
+
+    positions = {p.ticker for p in list_positions(conn)}
+    assert positions == {"AAPL"}
+
+    trades = list_trades(conn)
+    assert len(trades) == 1
+    assert trades[0].ticker == "ZZZZ"
+    assert trades[0].exit_reason == ExitReason.stop_loss
+    conn.close()
+
+
 def test_halted_cycle_evaluates_holdings_but_never_submits(tmp_path: Path) -> None:
     conn, rule_set, limits, sha256 = _db(tmp_path)
 
@@ -734,6 +802,11 @@ def test_priced_holdings_rule_exit_decision_survives_a_sibling_holdings_market_e
     assert list_equity_snapshots(conn) == ()
     assert not kill_switch.is_halted(conn)
 
+    cycle_row = conn.execute(
+        "SELECT outcome FROM cycles WHERE id = ?", (outcome.cycle_id,)
+    ).fetchone()
+    assert cycle_row["outcome"] == "market_unavailable"
+
     assert len(broker.submitted) == 1
     assert broker.submitted[0].ticker == "DOWN"
     assert broker.submitted[0].qty.shares == 7
@@ -752,6 +825,9 @@ def test_priced_holdings_rule_exit_decision_survives_a_sibling_holdings_market_e
     assert down_decisions[0].action.value == "sell"
     assert down_decisions[0].origin.value == "rule_exit"
     assert not any(d.action.value == "buy" for d in decisions)
+    # The unpriceable ticker itself never gets a decision recorded -- only
+    # its ticker id shows up in `holdings_outcome.market_errors`.
+    assert not any(d.ticker == "UNPRICED" for d in decisions)
     conn.close()
 
 

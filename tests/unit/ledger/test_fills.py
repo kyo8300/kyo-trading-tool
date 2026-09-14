@@ -394,6 +394,90 @@ def test_partial_fill_delta_records_incremental_price_not_brokers_cumulative_avg
     assert position.avg_cost.amount == Decimal("11.0000")
 
 
+def test_stale_poll_with_no_notional_progress_records_no_fill_and_still_advances(
+    conn,
+) -> None:
+    """R-18 review fix (fills.py `delta_notional.amount > 0` guard): a
+    poll that reports the exact same cumulative `filled_qty`/
+    `filled_avg_price` as the previous poll (a stale/duplicate broker read
+    with zero incremental notional) must not fabricate a zero-or-negative
+    `delta_price` fill. It must be skipped, `recorded_qty`/
+    `recorded_notional` stay put, and the *next* poll picks up the real
+    fill once the broker's numbers actually move. Polling must keep
+    advancing (`sleep` is still called) rather than looping forever on the
+    no-progress poll."""
+
+    class _StaleThenAdvanceBroker:
+        def __init__(self) -> None:
+            self._responses = [
+                BrokerOrder(
+                    broker_order_id="b-3",
+                    client_order_id="order_dec-1",
+                    status=OrderStatus.partially_filled,
+                    filled_qty=Quantity(3),
+                    filled_avg_price=Price(Decimal("10.00")),
+                    updated_at=_NOW,
+                ),
+                # Stale/duplicate read: identical cumulative qty and average
+                # price as the previous poll -> delta_notional == 0.
+                BrokerOrder(
+                    broker_order_id="b-3",
+                    client_order_id="order_dec-1",
+                    status=OrderStatus.partially_filled,
+                    filled_qty=Quantity(3),
+                    filled_avg_price=Price(Decimal("10.00")),
+                    updated_at=_NOW,
+                ),
+                BrokerOrder(
+                    broker_order_id="b-3",
+                    client_order_id="order_dec-1",
+                    status=OrderStatus.filled,
+                    filled_qty=Quantity(7),
+                    filled_avg_price=Price(Decimal("11.00")),
+                    updated_at=_NOW,
+                ),
+            ]
+
+        def get_order(self, client_order_id: str):
+            return Ok(self._responses.pop(0))
+
+    order = _order("order-stale-poll", "order_dec-1")
+    with transaction(conn):
+        repo.insert_order(conn, order)
+        repo.update_order_status(conn, "order-stale-poll", OrderStatus.submitted)
+
+    decision = repo.get_decision(conn, "dec-1")
+    sleep_calls: list[int] = []
+
+    poll_result = poll_and_settle(
+        conn,
+        _StaleThenAdvanceBroker(),
+        FixedClock(_NOW),
+        sleep_calls.append,
+        "order_dec-1",
+        "order-stale-poll",
+        decision,
+        Side.buy,
+        None,
+        poll_timeout_s=10,
+        poll_interval_s=1,
+    )
+
+    assert isinstance(poll_result, Ok)
+    # Only 2 real fills recorded -- the stale second poll added nothing.
+    assert poll_result.value.fills_recorded == 2
+    assert poll_result.value.final_status is OrderStatus.filled
+
+    fills = repo.list_fills(conn, "order-stale-poll")
+    assert [f.qty.shares for f in fills] == [3, 4]
+    assert [f.price.amount for f in fills] == [Decimal("10.00"), Decimal("11.75")]
+
+    # Polling advanced past the no-progress poll instead of looping forever
+    # on it: `sleep` was called once between poll 1 and poll 2, and once
+    # between poll 2 (stale, no terminal status) and poll 3 (terminal).
+    assert sleep_calls == [1, 1]
+
+
 def test_three_poll_partial_fill_deltas_each_get_their_own_incremental_price(conn) -> None:
     """R-18: extends the two-poll case to three polls (3 -> 5 -> 7 shares,
     broker cumulative average 10.00 -> 10.40 -> 11.00). Each poll's
