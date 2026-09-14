@@ -132,7 +132,15 @@ def _apply_buy(position: Position | None, fill: Fill, decision: Decision) -> Pos
         (position.avg_cost.amount * position.qty.shares + fill.price.amount * fill.qty.shares)
         / Decimal(total_shares)
     )
-    return OpenPosition(replace(position, qty=Quantity(total_shares), avg_cost=new_avg_cost))
+    new_high_watermark = Price(max(position.high_watermark.amount, fill.price.amount))
+    return OpenPosition(
+        replace(
+            position,
+            qty=Quantity(total_shares),
+            avg_cost=new_avg_cost,
+            high_watermark=new_high_watermark,
+        )
+    )
 
 
 def _apply_sell(
