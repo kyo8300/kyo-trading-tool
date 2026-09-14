@@ -26,7 +26,15 @@ from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from trader.config.mode import TradingMode
 from trader.domain.money import Price
@@ -62,6 +70,23 @@ class _RawBar(BaseModel):
         if value < 0:
             raise ValueError("must not be negative")
         return value
+
+    @field_validator("volume")
+    @classmethod
+    def _volume_is_whole(cls, value: float) -> float:
+        if value != int(value):
+            raise ValueError("must be a whole number")
+        return value
+
+    @model_validator(mode="after")
+    def _consistent_ohlc(self) -> _RawBar:
+        if self.high < self.low:
+            raise ValueError("high must be >= low")
+        if not (self.low <= self.open <= self.high):
+            raise ValueError("open must be between low and high")
+        if not (self.low <= self.close <= self.high):
+            raise ValueError("close must be between low and high")
+        return self
 
 
 class _RawTrade(BaseModel):
@@ -206,7 +231,9 @@ class AlpacaMarketData:
             return raw_result
 
         raw_value = raw_result.value
-        raw_bars = raw_value.get(ticker, []) if isinstance(raw_value, dict) else []
+        if not isinstance(raw_value, dict) or ticker not in raw_value:
+            return Err(MarketError(f"no bars data returned for {ticker}"))
+        raw_bars = raw_value[ticker]
         bars: list[Bar] = []
         for raw_bar in raw_bars:
             bar_result = _to_bar(ticker, raw_bar)

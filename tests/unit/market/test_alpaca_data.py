@@ -202,6 +202,56 @@ def test_daily_bars_is_ok_with_an_empty_list_for_a_known_ticker() -> None:
     assert result.value == ()
 
 
+def test_daily_bars_rejects_response_missing_the_ticker_key() -> None:
+    raw: dict[str, Any] = {}
+    market = _market(data_client=_FakeDataClient(bars_call=lambda request: raw))
+
+    result = market.daily_bars("AAPL")
+
+    assert isinstance(result, Err)
+
+
+def test_daily_bars_rejects_high_below_low_without_leaking_the_value() -> None:
+    raw = {"AAPL": [_raw_bar(h=8.0, lo=9.5)]}
+    market = _market(data_client=_FakeDataClient(bars_call=lambda request: raw))
+
+    result = market.daily_bars("AAPL")
+
+    assert isinstance(result, Err)
+    assert "8.0" not in result.error.message
+
+
+def test_daily_bars_rejects_open_outside_high_low_range() -> None:
+    raw = {"AAPL": [_raw_bar(o=20.0)]}
+    market = _market(data_client=_FakeDataClient(bars_call=lambda request: raw))
+
+    result = market.daily_bars("AAPL")
+
+    assert isinstance(result, Err)
+    assert "20.0" not in result.error.message
+
+
+def test_daily_bars_rejects_close_outside_high_low_range() -> None:
+    raw = {"AAPL": [_raw_bar(c=1.0)]}
+    market = _market(data_client=_FakeDataClient(bars_call=lambda request: raw))
+
+    result = market.daily_bars("AAPL")
+
+    assert isinstance(result, Err)
+    assert "1.0" not in result.error.message
+
+
+def test_daily_bars_rejects_non_integer_volume() -> None:
+    raw = {"AAPL": [_raw_bar(v=200_000.7)]}
+    market = _market(data_client=_FakeDataClient(bars_call=lambda request: raw))
+
+    result = market.daily_bars("AAPL")
+
+    assert isinstance(result, Err)
+    assert "200000.7" not in result.error.message
+    assert "200,000.7" not in result.error.message
+
+
 def test_latest_price_rejects_non_positive_price() -> None:
     raw = {"AAPL": {"p": 0.0}}
     market = _market(data_client=_FakeDataClient(trade_call=lambda request: raw))
