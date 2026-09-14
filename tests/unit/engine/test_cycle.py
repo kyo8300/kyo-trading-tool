@@ -671,9 +671,16 @@ def test_priced_holdings_rule_exit_decision_survives_a_sibling_holdings_market_e
     ticker's price is unavailable, `evaluate_holdings` still walks every
     position in order, so a stop-loss `rule_exit` sell decision on the
     *other*, correctly-priced ticker is inserted before the market error is
-    discovered. Fixing this implementation decision: the cycle still ends
-    `market_unavailable` (no equity_snapshots write, no new buys), but the
-    already-recorded sell decision on the priced ticker is not rolled back."""
+    discovered.
+
+    R-13 says sells never wait for the LLM and are rule-driven; a market data
+    failure on a *different*, unpriceable holding must not block execution of
+    a rule sell that *did* get priced -- spec エラー処理 only forbids new buys
+    and the equity_snapshots write when a held ticker can't be priced. So
+    when the market is open, the already-recorded DOWN stop-loss sell must
+    still be submitted to the broker and filled (closing a trade), while the
+    cycle as a whole still reports `market_unavailable` (no equity_snapshots
+    write, no kill switch, no new-buy candidates)."""
     conn, rule_set, limits, sha256 = _db(tmp_path)
     _ingest_mentions(conn, tmp_path)
 
@@ -700,6 +707,86 @@ def test_priced_holdings_rule_exit_decision_survives_a_sibling_holdings_market_e
     assert isinstance(upsert_position(conn, unpriced_position), Ok)
 
     market = FakeMarketData(prices={"DOWN": Price(Decimal("8.00"))}, bars={}, clock=_OPEN_CLOCK)
+    broker = _ImmediateFillBroker(fill_price=Price(Decimal("8.00")))
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=None,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+    assert outcome.outcome == "market_unavailable"
+    assert outcome.orders == 1
+    assert outcome.fills == 1
+    assert list_equity_snapshots(conn) == ()
+    assert not kill_switch.is_halted(conn)
+
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].ticker == "DOWN"
+    assert broker.submitted[0].qty.shares == 7
+
+    positions = {p.ticker for p in list_positions(conn)}
+    assert positions == {"UNPRICED"}
+
+    trades = list_trades(conn)
+    assert len(trades) == 1
+    assert trades[0].ticker == "DOWN"
+    assert trades[0].exit_reason == ExitReason.stop_loss
+
+    decisions = list_decisions(conn, outcome.cycle_id)
+    down_decisions = [d for d in decisions if d.ticker == "DOWN"]
+    assert len(down_decisions) == 1
+    assert down_decisions[0].action.value == "sell"
+    assert down_decisions[0].origin.value == "rule_exit"
+    assert not any(d.action.value == "buy" for d in decisions)
+    conn.close()
+
+
+def test_market_closed_and_holdings_market_error_submits_no_sells(
+    tmp_path: Path,
+) -> None:
+    """Same setup as the sibling-market-error case above, but the market is
+    closed. Per the existing closed-market rule (decisions are kept, nothing
+    is submitted), the rule sell on DOWN must not be executed either -- the
+    R-13 "sells don't wait for the LLM" priority never overrides "the market
+    is shut"."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    opened_at = _NOW - timedelta(days=10)
+    down_position = Position(
+        ticker="DOWN",
+        qty=Quantity(7),
+        avg_cost=Price(Decimal("10.00")),
+        opened_at=opened_at,
+        high_watermark=Price(Decimal("10.00")),
+        partial_tp_done=False,
+    )
+    unpriced_position = Position(
+        ticker="UNPRICED",
+        qty=Quantity(3),
+        avg_cost=Price(Decimal("10.00")),
+        opened_at=opened_at,
+        high_watermark=Price(Decimal("10.00")),
+        partial_tp_done=False,
+    )
+    assert isinstance(upsert_position(conn, down_position), Ok)
+    assert isinstance(upsert_position(conn, unpriced_position), Ok)
+
+    market = FakeMarketData(prices={"DOWN": Price(Decimal("8.00"))}, bars={}, clock=_CLOSED_CLOCK)
     broker = FakeBroker().with_account(
         BrokerAccount(cash=Money(Decimal("10.00")), equity=Money(Decimal("10.00")))
     )
@@ -725,7 +812,12 @@ def test_priced_holdings_rule_exit_decision_survives_a_sibling_holdings_market_e
     outcome = result.value
     assert outcome.outcome == "market_unavailable"
     assert outcome.orders == 0
+    assert outcome.fills == 0
+    assert broker.submit_call_count == 0
     assert list_equity_snapshots(conn) == ()
+
+    positions = {p.ticker for p in list_positions(conn)}
+    assert positions == {"DOWN", "UNPRICED"}
 
     decisions = list_decisions(conn, outcome.cycle_id)
     down_decisions = [d for d in decisions if d.ticker == "DOWN"]
