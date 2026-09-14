@@ -913,8 +913,11 @@ def test_max_concurrent_positions_rejects_new_buy(tmp_path: Path) -> None:
         upsert_result = upsert_position(conn, position)
         assert isinstance(upsert_result, Ok)
 
+    held_prices = {f"HLD{i}": Price(Decimal("10.00")) for i in range(5)}
     market = FakeMarketData(
-        prices={"AAPL": Price(Decimal("10"))}, bars={"AAPL": _bars("AAPL")}, clock=_OPEN_CLOCK
+        prices={"AAPL": Price(Decimal("10")), **held_prices},
+        bars={"AAPL": _bars("AAPL")},
+        clock=_OPEN_CLOCK,
     )
     broker = FakeBroker().with_account(
         BrokerAccount(cash=Money(Decimal("500.00")), equity=Money(Decimal("500.00")))
