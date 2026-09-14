@@ -6,9 +6,10 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from trader.domain.result import Ok
+from trader.rules import schema as rules_schema
 from trader.rules.schema import load_rules
 
 FIXTURES = Path(__file__).parent.parent.parent / "fixtures" / "rules"
@@ -54,6 +55,24 @@ def test_cost_assumptions_attribute_assignment_raises() -> None:
     rule_set = _load_valid()
     with pytest.raises(ValidationError):
         rule_set.cost_assumptions.commission_pct = Decimal("1")  # type: ignore[misc]
+
+
+def test_all_rule_set_models_are_frozen_and_forbid_extra() -> None:
+    """Every pydantic model in rules/schema.py must be `frozen=True,
+    extra="forbid"` -- not just RuleSet itself. A model that forgot the
+    config would silently accept unknown (e.g. absolute `*_usd`) keys or
+    allow mutation."""
+    models = [
+        obj
+        for obj in vars(rules_schema).values()
+        if isinstance(obj, type) and issubclass(obj, BaseModel) and obj is not BaseModel
+    ]
+    assert models, "expected to find at least one pydantic model in rules/schema.py"
+
+    for model in models:
+        config = model.model_config
+        assert config.get("frozen") is True, f"{model.__name__} is not frozen"
+        assert config.get("extra") == "forbid", f"{model.__name__} does not forbid extra keys"
 
 
 def test_model_copy_returns_new_object_and_leaves_original_unchanged() -> None:

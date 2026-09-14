@@ -16,7 +16,7 @@ FIXTURES = Path(__file__).parent.parent.parent / "fixtures" / "rules"
 
 def _assert_clean_error_message(message: str) -> None:
     assert "Traceback" not in message
-    assert "errors.pydantic.dev" not in message
+    assert "pydantic.dev" not in message
 
 
 def test_extra_absolute_usd_key_is_rejected() -> None:
@@ -59,6 +59,71 @@ def test_positive_stop_loss_pct_is_rejected(tmp_path: Path) -> None:
 
     assert isinstance(result, Err)
     assert "stop_loss_pct" in result.error.message
+    _assert_clean_error_message(result.error.message)
+
+
+def test_zero_stop_loss_pct_is_rejected(tmp_path: Path) -> None:
+    text = (FIXTURES / "valid.yaml").read_text(encoding="utf-8")
+    text = text.replace('stop_loss_pct: "-15"', 'stop_loss_pct: "0"')
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(text, encoding="utf-8")
+
+    result = load_rules(rules_path)
+
+    assert isinstance(result, Err)
+    assert "stop_loss_pct" in result.error.message
+    _assert_clean_error_message(result.error.message)
+
+
+def test_stop_loss_pct_at_negative_100_is_rejected(tmp_path: Path) -> None:
+    text = (FIXTURES / "valid.yaml").read_text(encoding="utf-8")
+    text = text.replace('stop_loss_pct: "-15"', 'stop_loss_pct: "-100"')
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(text, encoding="utf-8")
+
+    result = load_rules(rules_path)
+
+    assert isinstance(result, Err)
+    assert "stop_loss_pct" in result.error.message
+    _assert_clean_error_message(result.error.message)
+
+
+def test_partial_take_profit_fraction_of_one_is_rejected(tmp_path: Path) -> None:
+    text = (FIXTURES / "valid.yaml").read_text(encoding="utf-8")
+    text = text.replace('partial_take_profit_fraction: "0.5"', 'partial_take_profit_fraction: "1"')
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(text, encoding="utf-8")
+
+    result = load_rules(rules_path)
+
+    assert isinstance(result, Err)
+    assert "partial_take_profit_fraction" in result.error.message
+    _assert_clean_error_message(result.error.message)
+
+
+def test_max_concurrent_positions_zero_is_rejected(tmp_path: Path) -> None:
+    text = (FIXTURES / "valid.yaml").read_text(encoding="utf-8")
+    text = text.replace("max_concurrent_positions: 5", "max_concurrent_positions: 0")
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(text, encoding="utf-8")
+
+    result = load_rules(rules_path)
+
+    assert isinstance(result, Err)
+    assert "max_concurrent_positions" in result.error.message
+    _assert_clean_error_message(result.error.message)
+
+
+def test_excluded_tickers_with_non_string_entry_is_rejected(tmp_path: Path) -> None:
+    text = (FIXTURES / "valid.yaml").read_text(encoding="utf-8")
+    text = text.replace("excluded_tickers: []", "excluded_tickers: [123]")
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(text, encoding="utf-8")
+
+    result = load_rules(rules_path)
+
+    assert isinstance(result, Err)
+    assert "excluded_tickers" in result.error.message
     _assert_clean_error_message(result.error.message)
 
 
