@@ -19,11 +19,14 @@ from __future__ import annotations
 
 import fcntl
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from typer.testing import CliRunner
+
+from trader.analysis.llm_client import LlmError
 from trader.broker.broker import (
     BrokerAccount,
     BrokerError,
@@ -32,6 +35,7 @@ from trader.broker.broker import (
     OrderRequest,
 )
 from trader.broker.fake_broker import FakeBroker
+from trader.cli import app as cli_app
 from trader.config.mode import TradingMode
 from trader.domain.clock import FixedClock
 from trader.domain.models import ExitReason, OrderStatus, Position
@@ -41,9 +45,12 @@ from trader.engine import kill_switch
 from trader.engine.cycle import CycleDeps, run_cycle
 from trader.ledger.db import open_db
 from trader.ledger.portfolio_repository import (
+    get_engine_state,
     insert_rule_set,
+    list_equity_snapshots,
     list_positions,
     list_trades,
+    upsert_equity_snapshot,
     upsert_position,
 )
 from trader.ledger.repository import list_decisions
@@ -400,3 +407,447 @@ def test_stop_loss_sell_closes_trade_with_expected_pnl(tmp_path: Path) -> None:
     assert trade.realized_pnl.amount == Decimal("-14.00")
     assert trade.exit_reason == ExitReason.stop_loss
     conn.close()
+
+
+@dataclass
+class _ErrLlm:
+    """A `LlmClient` whose `complete` always fails (T-13 test plan: LLM Err)."""
+
+    model: str = "fake-model"
+
+    def complete(self, prompt: object) -> Result[object, object]:
+        return Err(LlmError("simulated llm outage", retryable=True))
+
+
+def test_llm_error_leaves_skip_decisions_for_every_candidate(tmp_path: Path) -> None:
+    """AC-8/T-13: an LLM failure must not stop the cycle -- every priced
+    candidate is recorded as a `skip` decision, no orders are placed, and
+    the cycle itself still ends `outcome=ok` (spec エラー処理: 'LLM 失敗 →
+    その銘柄は skip として記録し続行')."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    market = FakeMarketData(
+        prices={
+            "AAPL": Price(Decimal("10")),
+            "TSLA": Price(Decimal("20")),
+            "GME": Price(Decimal("15")),
+        },
+        bars={"AAPL": _bars("AAPL"), "TSLA": _bars("TSLA"), "GME": _bars("GME")},
+        clock=_OPEN_CLOCK,
+    )
+    broker = FakeBroker().with_account(
+        BrokerAccount(cash=Money(Decimal("500.00")), equity=Money(Decimal("500.00")))
+    )
+    llm = _ErrLlm()
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+    assert outcome.outcome == "ok"
+    assert outcome.orders == 0
+    assert broker.submit_call_count == 0
+
+    decisions = list_decisions(conn, outcome.cycle_id)
+    skip_decisions = [d for d in decisions if d.action.value == "skip"]
+    assert {d.ticker for d in skip_decisions} == {"AAPL", "TSLA", "GME"}
+    assert len(skip_decisions) == 3
+    for decision in skip_decisions:
+        assert decision.rule_check.value == "rejected"
+    conn.close()
+
+
+def test_market_clock_error_skips_equity_snapshot_and_orders(tmp_path: Path) -> None:
+    """AC-8/T-13: a `market_clock()` failure must not update `equity_snapshots`
+    and must not place any orders (spec エラー処理: マーケットデータ失敗 →
+    新規買いをしない, equity_snapshots はそのサイクルでは更新しない)."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    market = FakeMarketData(prices={}, bars={}, clock=_OPEN_CLOCK).failing({"market_clock"})
+    broker = FakeBroker()
+    llm = _FakeLlm(ticker="AAPL")
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+    assert outcome.outcome == "market_unavailable"
+    assert outcome.orders == 0
+    assert outcome.fills == 0
+    assert broker.submit_call_count == 0
+    assert list_equity_snapshots(conn) == ()
+    conn.close()
+
+
+def test_multi_cycle_partial_take_profit_then_trailing_stop(tmp_path: Path) -> None:
+    """R-21/AC-20/T-13 gap: a position that is partially taken-profit in one
+    cycle and trailing-stopped out in a later cycle must close a single
+    `trade` whose `entry_decision_id` is the original buy decision,
+    `exit_decision_ids` lists both exit decisions in order, and
+    `realized_pnl` is the sum across both sells (spec R-21, plan T-11 test
+    plan: '部分利確 → 残り → トレーリング売りで exit_decision_ids が 2 件')."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    # Cycle 1: LLM buy -> capital $500, 15% limit = $75, floor(75/10) = 7 shares @ 10.
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10"))}, bars={"AAPL": _bars("AAPL")}, clock=_OPEN_CLOCK
+    )
+    broker1 = _ImmediateFillBroker(fill_price=Price(Decimal("10")))
+    llm = _FakeLlm(ticker="AAPL")
+
+    deps1 = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker1,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+    result1 = run_cycle(deps1)
+    assert isinstance(result1, Ok)
+    outcome1 = result1.value
+    assert outcome1.orders == 1
+    assert outcome1.fills == 1
+
+    positions_after_1 = list_positions(conn)
+    assert len(positions_after_1) == 1
+    assert positions_after_1[0].qty.shares == 7
+
+    buy_decisions = [
+        d
+        for d in list_decisions(conn, outcome1.cycle_id)
+        if d.ticker == "AAPL" and d.action.value == "buy"
+    ]
+    assert len(buy_decisions) == 1
+    entry_decision_id = buy_decisions[0].id
+
+    # Cycle 2: price +30% (10 -> 13) triggers partial take-profit,
+    # fraction 0.5 -> floor(7 * 0.5) = 3 shares sold, 4 remain.
+    market2 = market.with_price("AAPL", Price(Decimal("13")))
+    broker2 = _ImmediateFillBroker(fill_price=Price(Decimal("13")))
+    deps2 = replace(deps1, broker=broker2, market=market2)
+    result2 = run_cycle(deps2)
+    assert isinstance(result2, Ok)
+    outcome2 = result2.value
+    assert outcome2.orders == 1
+    assert outcome2.fills == 1
+
+    positions_after_2 = list_positions(conn)
+    assert len(positions_after_2) == 1
+    assert positions_after_2[0].qty.shares == 4
+    assert positions_after_2[0].partial_tp_done is True
+    assert list_trades(conn) == ()
+
+    partial_tp_decisions = [
+        d
+        for d in list_decisions(conn, outcome2.cycle_id)
+        if d.ticker == "AAPL" and d.action.value == "sell"
+    ]
+    assert len(partial_tp_decisions) == 1
+    partial_tp_decision_id = partial_tp_decisions[0].id
+
+    # Cycle 3: high_watermark 13 * (1 - 20%) = 10.4 -> trailing stop sells
+    # the remaining 4 shares and closes the trade.
+    market3 = market2.with_price("AAPL", Price(Decimal("10.4")))
+    broker3 = _ImmediateFillBroker(fill_price=Price(Decimal("10.4")))
+    deps3 = replace(deps2, broker=broker3, market=market3)
+    result3 = run_cycle(deps3)
+    assert isinstance(result3, Ok)
+    outcome3 = result3.value
+    assert outcome3.orders == 1
+    assert outcome3.fills == 1
+
+    assert list_positions(conn) == ()
+    trades = list_trades(conn)
+    assert len(trades) == 1
+    trade = trades[0]
+    assert trade.ticker == "AAPL"
+    assert trade.exit_reason == ExitReason.trailing_stop
+    assert trade.entry_decision_id == entry_decision_id, (
+        "trade.entry_decision_id must reference the original cycle-1 buy decision, "
+        "not the closing sell decision (fills.poll_and_settle always calls "
+        "trade_closer.apply_fill with entry_decision_id=None)"
+    )
+    assert len(trade.exit_decision_ids) == 2, (
+        "trade.exit_decision_ids must accumulate both the partial-take-profit and "
+        "trailing-stop exit decisions across cycles, not just the closing one"
+    )
+    if len(trade.exit_decision_ids) == 2:
+        assert trade.exit_decision_ids[0] == partial_tp_decision_id
+    assert trade.realized_pnl.amount == Decimal("10.60"), (
+        "realized_pnl must be the sum of both sells "
+        "(3 * (13 - 10) + 4 * (10.4 - 10) = 9.00 + 1.60 = 10.60), not just the "
+        "closing fill's realized amount (fills.poll_and_settle always calls "
+        "trade_closer.apply_fill with realized_so_far=0)"
+    )
+    conn.close()
+
+
+def test_stop_loss_trade_entry_decision_references_original_buy_decision(
+    tmp_path: Path,
+) -> None:
+    """R-21/T-13: even a single-sell stop-loss exit in a later cycle must
+    close a trade whose `entry_decision_id` is the original LLM buy
+    decision (so `report` can show 'what was it bought for', spec R-21),
+    and that decision's `rationale` must be the LLM's own rationale."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10"))}, bars={"AAPL": _bars("AAPL")}, clock=_OPEN_CLOCK
+    )
+    broker1 = _ImmediateFillBroker(fill_price=Price(Decimal("10")))
+    llm = _FakeLlm(ticker="AAPL")
+
+    deps1 = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker1,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+    result1 = run_cycle(deps1)
+    assert isinstance(result1, Ok)
+    outcome1 = result1.value
+
+    buy_decisions = [
+        d
+        for d in list_decisions(conn, outcome1.cycle_id)
+        if d.ticker == "AAPL" and d.action.value == "buy"
+    ]
+    assert len(buy_decisions) == 1
+    buy_decision = buy_decisions[0]
+    assert buy_decision.rationale == "rising mentions"
+
+    # Cycle 2: price crashes to 8 (-20%, past the -15% stop loss).
+    market2 = market.with_price("AAPL", Price(Decimal("8")))
+    broker2 = _ImmediateFillBroker(fill_price=Price(Decimal("8")))
+    deps2 = replace(deps1, broker=broker2, market=market2)
+    result2 = run_cycle(deps2)
+    assert isinstance(result2, Ok)
+
+    trades = list_trades(conn)
+    assert len(trades) == 1
+    trade = trades[0]
+    assert trade.exit_reason == ExitReason.stop_loss
+    assert trade.entry_decision_id == buy_decision.id, (
+        "the closing sell's decision id must not silently become the "
+        "trade's entry_decision_id -- it must reference the LLM buy decision "
+        f"whose rationale was {buy_decision.rationale!r}"
+    )
+    conn.close()
+
+
+def test_drawdown_breach_halts_engine_and_blocks_next_cycle(tmp_path: Path) -> None:
+    """AC-18/T-13: peak_equity 600 -> current equity 500 is a 16.7% drawdown,
+    past the 15% limit. The kill switch must fire (`outcome=halted`,
+    `is_halted` persisted), and a later cycle with a pending LLM buy must
+    still submit nothing."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    snapshot_result = upsert_equity_snapshot(
+        conn,
+        "2026-09-13",
+        "paper",
+        Money(Decimal("600.00")),
+        Money(Decimal("0")),
+        Money(Decimal("600.00")),
+        Decimal("0"),
+        _NOW - timedelta(days=1),
+    )
+    assert isinstance(snapshot_result, Ok)
+
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10"))}, bars={"AAPL": _bars("AAPL")}, clock=_OPEN_CLOCK
+    )
+    broker = FakeBroker().with_account(
+        BrokerAccount(cash=Money(Decimal("500.00")), equity=Money(Decimal("500.00")))
+    )
+    llm = _FakeLlm(ticker="AAPL")
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+    assert outcome.outcome == "halted"
+    assert outcome.orders == 0
+    assert kill_switch.is_halted(conn)
+
+    result2 = run_cycle(replace(deps, broker=FakeBroker()))
+    assert isinstance(result2, Ok)
+    outcome2 = result2.value
+    assert outcome2.outcome == "halted"
+    assert outcome2.orders == 0
+    conn.close()
+
+
+def test_max_concurrent_positions_rejects_new_buy(tmp_path: Path) -> None:
+    """AC-11/T-13: with `max_concurrent_positions` (5) already held, a new
+    LLM buy must be rejected by the rule engine and never become an order."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    for i in range(5):
+        position = Position(
+            ticker=f"HLD{i}",
+            qty=Quantity(1),
+            avg_cost=Price(Decimal("10.00")),
+            opened_at=_NOW - timedelta(days=1),
+            high_watermark=Price(Decimal("10.00")),
+            partial_tp_done=False,
+        )
+        upsert_result = upsert_position(conn, position)
+        assert isinstance(upsert_result, Ok)
+
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10"))}, bars={"AAPL": _bars("AAPL")}, clock=_OPEN_CLOCK
+    )
+    broker = FakeBroker().with_account(
+        BrokerAccount(cash=Money(Decimal("500.00")), equity=Money(Decimal("500.00")))
+    )
+    llm = _FakeLlm(ticker="AAPL")
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+    assert outcome.orders == 0
+    assert broker.submit_call_count == 0
+
+    decisions = list_decisions(conn, outcome.cycle_id)
+    aapl_decisions = [d for d in decisions if d.ticker == "AAPL"]
+    assert len(aapl_decisions) == 1
+    assert aapl_decisions[0].rule_check.value == "rejected"
+    assert "max_concurrent_positions" in aapl_decisions[0].rule_check_reason
+    conn.close()
+
+
+def test_cycles_table_records_one_row_and_updates_last_cycle_id(tmp_path: Path) -> None:
+    """R-8/T-13: one `run_cycle` call writes exactly one `cycles` row with
+    both a start and finish timestamp, and `engine_state.last_cycle_id` is
+    updated to point at it."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10"))}, bars={"AAPL": _bars("AAPL")}, clock=_OPEN_CLOCK
+    )
+    broker = _ImmediateFillBroker(fill_price=Price(Decimal("10")))
+    llm = _FakeLlm(ticker="AAPL")
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+
+    rows = conn.execute("SELECT id, started_at, finished_at FROM cycles").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["id"] == outcome.cycle_id
+    assert rows[0]["started_at"] is not None
+    assert rows[0]["finished_at"] is not None
+
+    assert get_engine_state(conn, "last_cycle_id") == outcome.cycle_id
+    conn.close()
+
+
+def test_run_cycle_cli_refuses_to_run_under_trader_env_test() -> None:
+    """N-9/T-13: `trader run-cycle` must refuse to run for real under
+    `TRADER_ENV=test` (tests call `engine.cycle.run_cycle` directly instead)."""
+    runner = CliRunner()
+
+    result = runner.invoke(cli_app, ["run-cycle"])
+
+    assert result.exit_code == 1
+    assert "TRADER_ENV=test" in result.output
