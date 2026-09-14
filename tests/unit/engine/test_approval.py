@@ -157,3 +157,74 @@ def test_record_human_approval_rejects_a_failed_rule_check(conn) -> None:
 
     result = record_human_approval(conn, decision.id, FixedClock(_NOW), _MARKET_CLOCK)
     assert isinstance(result, Err)
+
+
+def test_live_mode_rejects_approval_expiring_at_exactly_now(conn) -> None:
+    """AC-16 boundary: `expires_at == now` is expired, not valid (repository
+    filters `expires_at > now` strictly)."""
+    decision = _decision(mode="live")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+        repo.insert_approval(
+            conn,
+            Approval(
+                id="appr-boundary",
+                decision_id=decision.id,
+                approver=Approver.kyo,
+                approved_at=_NOW - timedelta(hours=1),
+                expires_at=_NOW,
+            ),
+        )
+    result = resolve_approval(decision, TradingMode.live, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+def test_live_mode_accepts_approval_expiring_one_second_from_now(conn) -> None:
+    """AC-16 boundary: `expires_at == now + 1s` is still valid."""
+    decision = _decision(mode="live")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+        repo.insert_approval(
+            conn,
+            Approval(
+                id="appr-boundary-ok",
+                decision_id=decision.id,
+                approver=Approver.kyo,
+                approved_at=_NOW - timedelta(hours=1),
+                expires_at=_NOW + timedelta(seconds=1),
+            ),
+        )
+    result = resolve_approval(decision, TradingMode.live, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Ok)
+
+
+def test_live_mode_rejects_an_unexpired_system_approval(conn) -> None:
+    """AC-16: a `system` approval (as auto-created in paper mode) is never
+    valid in live mode, even if it is unexpired."""
+    decision = _decision(mode="live")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+        repo.insert_approval(
+            conn,
+            Approval(
+                id="appr-system",
+                decision_id=decision.id,
+                approver=Approver.system,
+                approved_at=_NOW,
+                expires_at=_NEXT_CLOSE,
+            ),
+        )
+    result = resolve_approval(decision, TradingMode.live, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+def test_order_qty_of_zero_when_notional_is_below_reference_price_is_rejected(conn) -> None:
+    """`_order_qty` = floor(proposed_notional / reference_price); when that
+    floors to 0 shares, no order can be sized, so `resolve_approval` must
+    return `Err` rather than proceed to a 0-share order."""
+    decision = _decision(
+        proposed_notional=Money(Decimal("5.00")),
+        reference_price=Price(Decimal("10.0000")),
+    )
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)

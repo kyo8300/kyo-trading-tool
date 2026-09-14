@@ -177,6 +177,32 @@ def test_broker_submit_failure_marks_order_failed_and_is_never_retried(conn) -> 
     assert stored_order.last_error is not None
 
 
+def test_broker_raising_instead_of_returning_err_is_not_swallowed(conn) -> None:
+    """Prove-It (AC-15): if the broker *raises* rather than returning
+    `Err(...)`, `execute` does not catch it in a silent `except` -- the
+    exception propagates so the caller (and its logs) see it, rather than
+    being hidden. This locks in the current implementation's decision
+    (no broad `except Exception` around `broker.submit_market_order`)."""
+    decision = _decision()
+    req = _approved_request(decision)
+
+    class _RaisingBroker(FakeBroker):
+        def submit_market_order(self, req):  # type: ignore[override]
+            raise RuntimeError("simulated broker crash")
+
+    broker = _RaisingBroker()
+
+    with pytest.raises(RuntimeError, match="simulated broker crash"):
+        order_executor.execute(req, conn, broker, FixedClock(_NOW), TradingMode.paper)
+
+    # The record-before-submit write already committed (decision/approval/
+    # order(recorded)) before the broker was ever called -- only the
+    # subsequent status update to submitted/failed didn't happen.
+    stored_order = repo.get_order(conn, f"order_{decision.id}")
+    assert stored_order is not None
+    assert stored_order.status is OrderStatus.recorded
+
+
 def test_already_persisted_decision_is_not_re_inserted(conn) -> None:
     decision = _decision(decision_id="dec-2")
     with transaction(conn):

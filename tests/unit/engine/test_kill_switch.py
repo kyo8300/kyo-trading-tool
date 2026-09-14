@@ -77,6 +77,50 @@ def test_resume_clears_halted_state(db_path: Path) -> None:
     conn.close()
 
 
+def test_resume_does_not_change_peak_equity(db_path: Path) -> None:
+    """AC-18: `resume` clears halted state but must not touch
+    `equity_snapshots.peak_equity` (R-19: drawdown tracking survives a halt)."""
+    from trader.domain.money import Money
+    from trader.ledger import portfolio_repository as portfolio_repo
+
+    conn = open_db(db_path).value
+    portfolio_repo.upsert_equity_snapshot(
+        conn,
+        snapshot_date="2026-01-05",
+        mode="paper",
+        cash=Money(Decimal("400.00")),
+        positions_value=Money(Decimal("100.00")),
+        peak_equity=Money(Decimal("550.00")),
+        drawdown_pct=Decimal("9.09"),
+        taken_at=_NOW,
+    )
+    broker = FakeBroker().with_open_orders(0)
+    kill_switch.trigger(_BREACH, broker, conn, FixedClock(_NOW))
+
+    resume_result = kill_switch.resume(conn)
+    assert isinstance(resume_result, Ok)
+    assert not kill_switch.is_halted(conn)
+
+    row = conn.execute(
+        "SELECT peak_equity FROM equity_snapshots WHERE snapshot_date = ?", ("2026-01-05",)
+    ).fetchone()
+    assert row["peak_equity"] == "550.00"
+    conn.close()
+
+
+def test_resume_when_not_already_halted_is_not_an_error(db_path: Path) -> None:
+    """AC-18: calling `resume` on an engine that is not halted is a no-op,
+    not a failure (idempotent)."""
+    conn = open_db(db_path).value
+    assert not kill_switch.is_halted(conn)
+
+    result = kill_switch.resume(conn)
+
+    assert isinstance(result, Ok)
+    assert not kill_switch.is_halted(conn)
+    conn.close()
+
+
 def test_halted_is_persisted_even_when_cancel_all_open_fails(db_path: Path) -> None:
     conn = open_db(db_path).value
 
