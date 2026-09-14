@@ -42,7 +42,14 @@ def _read_tweets(path: Path) -> Result[list[Any], IngestError]:
         return Err(_boundary_error("tweets.json の形式が不正 (JSON として解析できない)"))
 
     if isinstance(data, dict):
-        data = data.get("tweets", [])
+        if not isinstance(data.get("tweets"), list):
+            return Err(
+                _boundary_error(
+                    "tweets.json の形式が不正 (トップレベルが配列、"
+                    "または 'tweets' キーに配列を持つオブジェクトである必要がある)"
+                )
+            )
+        data = data["tweets"]
     if not isinstance(data, list):
         return Err(_boundary_error("tweets.json の形式が不正 (配列が期待される)"))
     return Ok(data)
