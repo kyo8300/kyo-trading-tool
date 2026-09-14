@@ -85,3 +85,18 @@ def test_mention_ids_include_every_mention_for_the_ticker() -> None:
 
 def test_no_mentions_returns_empty_tuple() -> None:
     assert build_evidence((), now=_NOW) == ()
+
+
+def test_mention_exactly_at_the_window_boundary_counts_as_prior_not_recent() -> None:
+    # Pin the implementation's boundary decision: `window_days` ago exactly
+    # (== recent_cutoff) is excluded from the "recent" bucket (strict `>`)
+    # and falls into the "prior" bucket instead.
+    from datetime import timedelta
+
+    exactly_14_days_ago = _NOW - timedelta(days=14)
+    mentions = (_mention("AAPL", "1", exactly_14_days_ago),)
+
+    evidences = build_evidence(mentions, now=_NOW, window_days=14)
+
+    assert evidences[0].stats.mention_count_last_14d == 0
+    assert evidences[0].stats.mention_count_prior_14d == 1
