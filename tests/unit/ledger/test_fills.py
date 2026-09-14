@@ -4,6 +4,7 @@ non-fill terminal states (canceled/rejected) on `orders.status`.
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -165,6 +166,85 @@ def test_rejected_order_records_last_error(conn) -> None:
     stored = repo.get_order(conn, "order-3")
     assert stored.status is OrderStatus.rejected
     assert stored.last_error == "insufficient buying power"
+
+
+def test_duplicate_client_order_id_is_rejected(conn) -> None:
+    order_a = _order("order-dup-a", "order_dec-1-dup")
+    order_b = _order("order-dup-b", "order_dec-1-dup")
+
+    with transaction(conn):
+        repo.insert_order(conn, order_a)
+
+    with transaction(conn):
+        result = repo.insert_order(conn, order_b)
+
+    assert result.is_err()
+    stored_ids = {
+        row["id"] for row in conn.execute("SELECT id FROM orders WHERE decision_id = 'dec-1'")
+    }
+    assert stored_ids == {"order-dup-a"}
+
+
+def test_duplicate_client_order_id_raises_integrity_error_when_uncaught(conn) -> None:
+    order_a = _order("order-dup-c", "order_dec-1-dup-2")
+    order_b = _order("order-dup-d", "order_dec-1-dup-2")
+    with transaction(conn):
+        repo.insert_order(conn, order_a)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO orders ("
+            "id, decision_id, approval_id, client_order_id, broker_order_id,"
+            " mode, side, qty, order_type, status, submitted_at, last_error"
+            ") VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, NULL, NULL)",
+            (
+                order_b.id,
+                order_b.decision_id,
+                order_b.approval_id,
+                order_b.client_order_id,
+                order_b.mode,
+                order_b.side.value,
+                "7",
+                order_b.order_type,
+                order_b.status.value,
+            ),
+        )
+
+
+def test_update_order_status_records_broker_order_id(conn) -> None:
+    order = _order("order-5", "order_dec-1-broker-id")
+    with transaction(conn):
+        repo.insert_order(conn, order)
+
+    with transaction(conn):
+        repo.update_order_status(
+            conn, "order-5", OrderStatus.submitted, broker_order_id="alpaca-xyz"
+        )
+
+    stored = repo.get_order(conn, "order-5")
+    assert stored.status is OrderStatus.submitted
+    assert stored.broker_order_id == "alpaca-xyz"
+
+
+def test_fill_fee_round_trips_as_canonical_decimal(conn) -> None:
+    order = _order("order-6", "order_dec-1-fee")
+    with transaction(conn):
+        repo.insert_order(conn, order)
+        repo.insert_fill(
+            conn,
+            Fill(
+                id="fill-fee",
+                order_id="order-6",
+                filled_at=_NOW,
+                qty=Quantity(7),
+                price=Price(Decimal("10")),
+                fee=Money(Decimal("0.35")),
+            ),
+        )
+
+    fills = repo.list_fills(conn, "order-6")
+    assert len(fills) == 1
+    assert fills[0].fee == Money(Decimal("0.35"))
 
 
 def test_with_status_helper_does_not_mutate_original() -> None:
