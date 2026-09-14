@@ -28,11 +28,11 @@ from trader.analysis.analyst import LlmClient
 from trader.broker.broker import Broker
 from trader.config.mode import TradingMode
 from trader.domain.clock import Clock
-from trader.domain.models import Action, RuleCheck, Trade
+from trader.domain.models import Action, Decision, ExitReason, RuleCheck, Trade
 from trader.domain.money import Money
 from trader.domain.result import Err, Ok, Result
 from trader.engine.approval import resolve_approval
-from trader.engine.candidates import CandidatesOutcome, evaluate_candidates
+from trader.engine.candidates import evaluate_candidates
 from trader.engine.fills import poll_and_settle
 from trader.engine.holdings import HoldingsOutcome, evaluate_holdings
 from trader.engine.kill_switch import is_halted
@@ -192,82 +192,19 @@ def run_cycle(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
         _release_lock(handle)
 
 
-def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
-    conn = deps.conn
-    started_at = deps.clock.now()
-    cycle_id = f"cycle_{uuid.uuid4().hex}"
+def _evaluate_risk(
+    deps: CycleDeps,
+    conn: sqlite3.Connection,
+    cycle_id: str,
+    holdings_outcome: HoldingsOutcome,
+    decisions_count: int,
+) -> Result[CycleOutcome, CycleError] | None:
+    """Fetch account equity, upsert today's `equity_snapshots`, and check
+    daily/weekly/drawdown loss limits (a breach fires the kill switch).
 
-    insert_result = insert_cycle(conn, cycle_id, started_at, deps.mode.value)
-    if isinstance(insert_result, Err):
-        return Err(CycleError(insert_result.error.message))
-
-    if is_halted(conn):
-        holdings_result = evaluate_holdings(
-            conn,
-            list_positions(conn),
-            deps.market,
-            deps.rules,
-            deps.clock,
-            cycle_id,
-            deps.rule_set_sha256,
-            deps.mode.value,
-        )
-        decisions_count = (
-            len(holdings_result.value.decisions) if isinstance(holdings_result, Ok) else 0
-        )
-        return _finish(
-            conn, cycle_id, "halted", "engine is halted", decisions_count, 0, 0, deps.clock
-        )
-
-    market_clock_result = deps.market.market_clock()
-    if isinstance(market_clock_result, Err):
-        return _finish(
-            conn,
-            cycle_id,
-            "market_unavailable",
-            market_clock_result.error.message,
-            0,
-            0,
-            0,
-            deps.clock,
-        )
-    market_clock = market_clock_result.value
-
-    positions = list_positions(conn)
-    holdings_result = evaluate_holdings(
-        conn,
-        positions,
-        deps.market,
-        deps.rules,
-        deps.clock,
-        cycle_id,
-        deps.rule_set_sha256,
-        deps.mode.value,
-    )
-    if isinstance(holdings_result, Err):
-        return _finish(conn, cycle_id, "error", holdings_result.error.message, 0, 0, 0, deps.clock)
-    holdings_outcome = holdings_result.value
-    decisions_count = len(holdings_outcome.decisions)
-
-    if holdings_outcome.market_errors:
-        # spec エラー処理: a held position whose price could not be fetched
-        # means the cycle cannot judge sells or value the portfolio, so no
-        # equity_snapshots write, no loss-limit/kill-switch evaluation
-        # against incomplete equity, and no new buys -- the whole cycle
-        # stops here as `market_unavailable` (R-19 review finding). Holding
-        # decisions already recorded above (e.g. exits on priced tickers)
-        # are kept.
-        return _finish(
-            conn,
-            cycle_id,
-            "market_unavailable",
-            "no price for held ticker(s): " + ", ".join(holdings_outcome.market_errors),
-            decisions_count,
-            0,
-            0,
-            deps.clock,
-        )
-
+    Returns a finished `Result` if the cycle must stop here (account/
+    snapshot error, or a loss-limit breach), or `None` to keep going.
+    """
     account_result = deps.broker.account()
     if isinstance(account_result, Err):
         return _finish(
@@ -338,6 +275,98 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
             )
         return _finish(conn, cycle_id, "halted", breach.reason, decisions_count, 0, 0, deps.clock)
 
+    return None
+
+
+def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
+    conn = deps.conn
+    started_at = deps.clock.now()
+    cycle_id = f"cycle_{uuid.uuid4().hex}"
+
+    insert_result = insert_cycle(conn, cycle_id, started_at, deps.mode.value)
+    if isinstance(insert_result, Err):
+        return Err(CycleError(insert_result.error.message))
+
+    if is_halted(conn):
+        holdings_result = evaluate_holdings(
+            conn,
+            list_positions(conn),
+            deps.market,
+            deps.rules,
+            deps.clock,
+            cycle_id,
+            deps.rule_set_sha256,
+            deps.mode.value,
+        )
+        decisions_count = (
+            len(holdings_result.value.decisions) if isinstance(holdings_result, Ok) else 0
+        )
+        return _finish(
+            conn, cycle_id, "halted", "engine is halted", decisions_count, 0, 0, deps.clock
+        )
+
+    market_clock_result = deps.market.market_clock()
+    if isinstance(market_clock_result, Err):
+        return _finish(
+            conn,
+            cycle_id,
+            "market_unavailable",
+            market_clock_result.error.message,
+            0,
+            0,
+            0,
+            deps.clock,
+        )
+    market_clock = market_clock_result.value
+
+    positions = list_positions(conn)
+    holdings_result = evaluate_holdings(
+        conn,
+        positions,
+        deps.market,
+        deps.rules,
+        deps.clock,
+        cycle_id,
+        deps.rule_set_sha256,
+        deps.mode.value,
+    )
+    if isinstance(holdings_result, Err):
+        return _finish(conn, cycle_id, "error", holdings_result.error.message, 0, 0, 0, deps.clock)
+    holdings_outcome = holdings_result.value
+    decisions_count = len(holdings_outcome.decisions)
+
+    if holdings_outcome.market_errors:
+        # spec エラー処理: a held position whose price could not be fetched
+        # means the cycle cannot judge sells or value the portfolio, so no
+        # equity_snapshots write, no loss-limit/kill-switch evaluation
+        # against incomplete equity, and no new buys -- the whole cycle
+        # stops here as `market_unavailable` (R-19 review finding). But
+        # R-13 says sells are rule-driven and never wait for the LLM: a
+        # rule-exit sell decision that *was* successfully priced on a
+        # different, priced holding must still be submitted and filled (as
+        # long as the market is open) even though a sibling holding's price
+        # is missing this cycle (R-13 review finding, cycle.py:252).
+        orders_count = 0
+        fills_count = 0
+        if market_clock.is_open:
+            orders_count, fills_count = _execute_passed_decisions(
+                deps, conn, holdings_outcome.decisions, holdings_outcome.exit_reasons, market_clock
+            )
+        return _finish(
+            conn,
+            cycle_id,
+            "market_unavailable",
+            "no price for held ticker(s): " + ", ".join(holdings_outcome.market_errors),
+            decisions_count,
+            orders_count,
+            fills_count,
+            deps.clock,
+        )
+
+    risk_outcome = _evaluate_risk(deps, conn, cycle_id, holdings_outcome, decisions_count)
+    if risk_outcome is not None:
+        return risk_outcome
+
     held_tickers = {p.ticker for p in positions}
     mentions = list_mentions(conn, _SERENITY_SOURCE_ID)
     candidates_result = evaluate_candidates(
@@ -372,8 +401,9 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
     if not market_clock.is_open:
         return _finish(conn, cycle_id, "ok", None, decisions_count, 0, 0, deps.clock)
 
+    all_decisions = (*holdings_outcome.decisions, *candidates_outcome.decisions)
     orders_count, fills_count = _execute_passed_decisions(
-        deps, conn, holdings_outcome, candidates_outcome, market_clock
+        deps, conn, all_decisions, holdings_outcome.exit_reasons, market_clock
     )
 
     return _finish(
@@ -384,14 +414,13 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
 def _execute_passed_decisions(
     deps: CycleDeps,
     conn: sqlite3.Connection,
-    holdings_outcome: HoldingsOutcome,
-    candidates_outcome: CandidatesOutcome,
+    decisions: tuple[Decision, ...],
+    exit_reasons: dict[str, ExitReason],
     market_clock: MarketClock,
 ) -> tuple[int, int]:
     orders_count = 0
     fills_count = 0
-    all_decisions = (*holdings_outcome.decisions, *candidates_outcome.decisions)
-    for decision in all_decisions:
+    for decision in decisions:
         if decision.rule_check is not RuleCheck.passed or decision.action not in (
             Action.buy,
             Action.sell,
@@ -408,7 +437,7 @@ def _execute_passed_decisions(
         order = exec_result.value
         orders_count += 1
 
-        exit_reason = holdings_outcome.exit_reasons.get(decision.id)
+        exit_reason = exit_reasons.get(decision.id)
         poll_result = poll_and_settle(
             conn,
             deps.broker,

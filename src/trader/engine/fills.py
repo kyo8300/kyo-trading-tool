@@ -222,24 +222,33 @@ def poll_and_settle(
                 broker_order.filled_avg_price.amount * broker_order.filled_qty.shares
             )
             delta_notional = cumulative_notional - recorded_notional
-            delta_price = Price(delta_notional.amount / Decimal(new_qty))
-            fill = Fill(
-                id=f"fill_{uuid.uuid4().hex}",
-                order_id=order_id,
-                filled_at=clock.now(),
-                qty=Quantity(new_qty),
-                price=delta_price,
-                fee=Money(Decimal(0)),
-            )
-            insert_result = insert_fill(conn, fill)
-            if isinstance(insert_result, Err):
-                return Err(FillsError(insert_result.error.message))
-            settle_result = _settle_fill(conn, decision, fill, side, exit_reason)
-            if isinstance(settle_result, Err):
-                return settle_result
-            recorded_qty = broker_order.filled_qty.shares
-            recorded_notional = cumulative_notional
-            fills_recorded += 1
+            if delta_notional.amount > 0:
+                delta_price = Price(delta_notional.amount / Decimal(new_qty))
+                fill = Fill(
+                    id=f"fill_{uuid.uuid4().hex}",
+                    order_id=order_id,
+                    filled_at=clock.now(),
+                    qty=Quantity(new_qty),
+                    price=delta_price,
+                    fee=Money(Decimal(0)),
+                )
+                insert_result = insert_fill(conn, fill)
+                if isinstance(insert_result, Err):
+                    return Err(FillsError(insert_result.error.message))
+                settle_result = _settle_fill(conn, decision, fill, side, exit_reason)
+                if isinstance(settle_result, Err):
+                    return settle_result
+                recorded_qty = broker_order.filled_qty.shares
+                recorded_notional = cumulative_notional
+                fills_recorded += 1
+            # else: a non-positive incremental notional (e.g. a stale/
+            # duplicate poll read where the broker's cumulative average
+            # price did not actually advance for this delta) would back out
+            # a zero-or-negative `delta_price`, silently recording a fill at
+            # a fabricated price and corrupting realized P&L. Skip recording
+            # a fill this poll -- `recorded_qty`/`recorded_notional` stay put
+            # so the next poll (or timeout) picks up the real fill once the
+            # broker's numbers move (N-6/R-18).
 
         if broker_order.status != last_status:
             update_result = update_order_status(
