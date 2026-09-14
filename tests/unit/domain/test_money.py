@@ -69,6 +69,12 @@ def test_quantity_parse_rejects_garbage() -> None:
     assert isinstance(result, Err)
 
 
+def test_quantity_parse_accepts_zero() -> None:
+    result = Quantity.parse("0")
+    assert isinstance(result, Ok)
+    assert result.value.shares == 0
+
+
 @pytest.mark.parametrize("value", ["500", "75.00", "-15.25", "0"])
 def test_canonical_roundtrip(value: str) -> None:
     decimal_value = Decimal(value)
@@ -81,3 +87,32 @@ def test_canonical_roundtrip(value: str) -> None:
 def test_from_canonical_rejects_invalid_string() -> None:
     result = from_canonical("not-a-decimal")
     assert isinstance(result, Err)
+
+
+def test_from_canonical_rejects_empty_string() -> None:
+    result = from_canonical("")
+    assert isinstance(result, Err)
+
+
+@pytest.mark.parametrize("value", ["1e5", "NaN", "Infinity", "-Infinity", "sNaN"])
+def test_from_canonical_rejects_non_canonical_special_values(value: str) -> None:
+    """N-1: amounts are plain decimal strings; scientific notation and the
+    IEEE-754-style NaN/Infinity Decimal specials must never round-trip as a
+    valid Money/Price/Quantity amount."""
+    result = from_canonical(value)
+    assert isinstance(result, Err), f"{value!r} should be rejected, got {result!r}"
+
+
+def test_money_quantizes_1_005_to_1_00_round_half_even() -> None:
+    assert Money(Decimal("1.005")).amount == Decimal("1.00")
+
+
+@pytest.mark.parametrize(
+    ("capital", "pct", "expected"),
+    [
+        (Decimal("500"), Decimal("-15"), Decimal("-75.00")),
+    ],
+)
+def test_pct_of_negative_pct(capital: Decimal, pct: Decimal, expected: Decimal) -> None:
+    """exit.stop_loss_pct is negative (e.g. -15); pct_of must handle it."""
+    assert pct_of(Money(capital), pct) == Money(expected)

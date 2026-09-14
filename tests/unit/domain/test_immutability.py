@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import ModuleType
 
 import pytest
 
+from trader.domain import models
 from trader.domain.clock import FixedClock, SystemClock
 from trader.domain.models import (
     Action,
@@ -194,3 +198,25 @@ def test_decision_and_related_records_are_frozen() -> None:
     ):
         with pytest.raises(FrozenInstanceError):
             setattr(obj, field, value)
+
+
+def _dataclasses_in_module(module: ModuleType) -> list[type]:
+    return [
+        obj
+        for _name, obj in inspect.getmembers(module, inspect.isclass)
+        if obj.__module__ == module.__name__ and dataclasses.is_dataclass(obj)
+    ]
+
+
+def test_every_dataclass_in_models_module_is_frozen() -> None:
+    """AC-26 exhaustive sweep: any dataclass added to `models.py` in the
+    future must be frozen (N-7), without needing to remember to add it to
+    the manual instance-construction tests above."""
+    found = _dataclasses_in_module(models)
+    assert found, "expected models.py to define at least one dataclass"
+    not_frozen = [
+        cls.__name__
+        for cls in found
+        if not cls.__dataclass_params__.frozen  # type: ignore[attr-defined]
+    ]
+    assert not_frozen == [], f"non-frozen dataclasses in models.py: {not_frozen}"
