@@ -172,9 +172,69 @@ def run_cycle() -> None:
 
 
 @app.command("approve")
-def approve(decision_id: str = typer.Argument(..., help="Decision id to approve")) -> None:
-    """Approve a pending decision (live mode)."""
-    _not_implemented("approve")
+def approve(
+    decision_id: str = typer.Argument(..., help="Decision id to approve"),
+    expires_at: str | None = typer.Option(
+        None,
+        "--expires-at",
+        help=(
+            "ISO 8601 UTC timestamp this approval expires at (the next market "
+            "session close, e.g. 2026-01-05T21:00:00+00:00). Required: fetching "
+            "the real market clock here would make 'approve' depend on the "
+            "network (N-9). Run 'trader status' or check the broker for the "
+            "current session's close time."
+        ),
+    ),
+    db: str | None = typer.Option(
+        None, "--db", help="Path to the ledger database (default: $TRADER_DB_PATH)"
+    ),
+) -> None:
+    """Record a human (`kyo`) approval for a decision that passed rule checks (R-17)."""
+    from datetime import datetime as dt
+
+    from trader.domain.clock import SystemClock
+    from trader.domain.result import Err
+    from trader.engine.approval import record_human_approval
+    from trader.ledger.db import open_db
+    from trader.market.data_provider import MarketClock
+
+    if expires_at is None:
+        typer.echo(
+            "trader approve: --expires-at is required (see 'trader approve --help')",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        parsed_expires_at = dt.fromisoformat(expires_at)
+    except ValueError:
+        typer.echo(
+            f"trader approve: --expires-at is not a valid ISO 8601 timestamp: {expires_at}",
+            err=True,
+        )
+        raise typer.Exit(code=1) from None
+
+    db_path = Path(db or os.environ.get("TRADER_DB_PATH", _DEFAULT_DB_PATH))
+    db_result = open_db(db_path)
+    if isinstance(db_result, Err):
+        typer.echo(f"trader approve: {db_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    conn = db_result.value
+
+    try:
+        market_clock = MarketClock(
+            is_open=False, next_open=parsed_expires_at, next_close=parsed_expires_at
+        )
+        result = record_human_approval(conn, decision_id, SystemClock(), market_clock)
+    finally:
+        conn.close()
+
+    if isinstance(result, Err):
+        typer.echo(f"trader approve: {result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"trader approve: approved decision {decision_id} (expires {parsed_expires_at.isoformat()})"
+    )
 
 
 @app.command("report")
@@ -273,15 +333,95 @@ def rules_approve(
 
 
 @app.command("resume")
-def resume() -> None:
-    """Clear the kill-switch halted state."""
-    _not_implemented("resume")
+def resume(
+    db: str | None = typer.Option(
+        None, "--db", help="Path to the ledger database (default: $TRADER_DB_PATH)"
+    ),
+) -> None:
+    """Clear the kill-switch halted state (R-19). Only kyo should run this."""
+    from trader.domain.result import Err
+    from trader.engine.kill_switch import is_halted
+    from trader.engine.kill_switch import resume as clear_halt
+    from trader.ledger.db import open_db
+
+    db_path = Path(db or os.environ.get("TRADER_DB_PATH", _DEFAULT_DB_PATH))
+    db_result = open_db(db_path)
+    if isinstance(db_result, Err):
+        typer.echo(f"trader resume: {db_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    conn = db_result.value
+
+    try:
+        if not is_halted(conn):
+            typer.echo("trader resume: engine is not halted")
+            return
+
+        result = clear_halt(conn)
+        if isinstance(result, Err):
+            typer.echo(f"trader resume: {result.error.message}", err=True)
+            raise typer.Exit(code=1)
+    finally:
+        conn.close()
+
+    typer.echo("trader resume: resumed")
 
 
 @app.command("status")
-def status() -> None:
-    """Show current engine state."""
-    _not_implemented("status")
+def status(
+    db: str | None = typer.Option(
+        None, "--db", help="Path to the ledger database (default: $TRADER_DB_PATH)"
+    ),
+) -> None:
+    """Show halted state, open positions, and the most recent cycle."""
+    from trader.domain.result import Err
+    from trader.engine.kill_switch import halt_info
+    from trader.ledger.db import open_db
+    from trader.ledger.portfolio_repository import list_positions
+
+    db_path = Path(db or os.environ.get("TRADER_DB_PATH", _DEFAULT_DB_PATH))
+    if not db_path.exists():
+        typer.echo("trader status: no database found (run 'trader ingest' first)", err=True)
+        raise typer.Exit(code=1)
+
+    db_result = open_db(db_path)
+    if isinstance(db_result, Err):
+        typer.echo(f"trader status: {db_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    conn = db_result.value
+
+    try:
+        info = halt_info(conn)
+        if info is None:
+            typer.echo("engine: running")
+        else:
+            typer.echo(f"engine: HALTED ({info.reason}) at {info.halted_at.isoformat()}")
+
+        positions = list_positions(conn)
+        if positions:
+            typer.echo("positions:")
+            for position in positions:
+                typer.echo(
+                    f"  {position.ticker}: {position.qty.shares} shares "
+                    f"@ avg {position.avg_cost.amount}"
+                )
+        else:
+            typer.echo("positions: none")
+
+        cycle_row = conn.execute(
+            "SELECT id, started_at, finished_at, mode, outcome FROM cycles "
+            "ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        if cycle_row is None:
+            typer.echo("last cycle: none")
+        else:
+            typer.echo(
+                f"last cycle: {cycle_row['id']} ({cycle_row['mode']}) "
+                f"started {cycle_row['started_at']} "
+                f"finished {cycle_row['finished_at'] or '-'} "
+                f"outcome {cycle_row['outcome'] or '-'}"
+            )
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

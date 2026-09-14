@@ -240,19 +240,27 @@ def update_order_status(
     status: OrderStatus,
     last_error: str | None = None,
     broker_order_id: str | None = None,
+    submitted_at: datetime | None = None,
 ) -> Result[None, LedgerError]:
-    """Transition an order's status, optionally recording an error or the
-    broker-assigned id (R-16, R-18)."""
+    """Transition an order's status, optionally recording an error, the
+    broker-assigned id, or the submission time (R-16, R-18)."""
     try:
         cursor = conn.execute(
             """
             UPDATE orders
             SET status = ?,
                 last_error = COALESCE(?, last_error),
-                broker_order_id = COALESCE(?, broker_order_id)
+                broker_order_id = COALESCE(?, broker_order_id),
+                submitted_at = COALESCE(?, submitted_at)
             WHERE id = ?
             """,
-            (status.value, last_error, broker_order_id, order_id),
+            (
+                status.value,
+                last_error,
+                broker_order_id,
+                _dt_to_text(submitted_at) if submitted_at else None,
+                order_id,
+            ),
         )
         if cursor.rowcount == 0:
             return Err(LedgerError(f"no such order: {order_id}"))
