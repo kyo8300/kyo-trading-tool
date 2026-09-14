@@ -254,3 +254,54 @@ def test_with_status_helper_does_not_mutate_original() -> None:
 
     assert order.status is OrderStatus.recorded
     assert updated.status is OrderStatus.failed
+
+
+def test_list_orders_round_trips_every_order(conn) -> None:
+    order_a = _order("order-list-a", "order_dec-1-list-a")
+    order_b = _order("order-list-b", "order_dec-1-list-b")
+    with transaction(conn):
+        repo.insert_order(conn, order_a)
+        repo.insert_order(conn, order_b)
+
+    stored = repo.list_orders(conn)
+
+    assert {o.id for o in stored} >= {"order-list-a", "order-list-b"}
+    by_id = {o.id: o for o in stored}
+    assert by_id["order-list-a"] == order_a
+    assert by_id["order-list-b"] == order_b
+
+
+def test_list_all_fills_round_trips_fills_across_orders(conn) -> None:
+    order_a = _order("order-list-c", "order_dec-1-list-c")
+    order_b = _order("order-list-d", "order_dec-1-list-d")
+    fill_a = Fill(
+        id="fill-list-a",
+        order_id="order-list-c",
+        filled_at=_NOW,
+        qty=Quantity(3),
+        price=Price(Decimal("10")),
+        fee=Money(Decimal("0")),
+    )
+    fill_b = Fill(
+        id="fill-list-b",
+        order_id="order-list-d",
+        filled_at=_NOW,
+        qty=Quantity(4),
+        price=Price(Decimal("12")),
+        fee=Money(Decimal("0.10")),
+    )
+    with transaction(conn):
+        repo.insert_order(conn, order_a)
+        repo.insert_order(conn, order_b)
+        repo.insert_fill(conn, fill_a)
+        repo.insert_fill(conn, fill_b)
+
+    stored = repo.list_all_fills(conn)
+
+    by_id = {f.id: f for f in stored}
+    assert by_id["fill-list-a"] == fill_a
+    assert by_id["fill-list-b"] == fill_b
+
+
+def test_list_all_fills_is_empty_with_no_fills(conn) -> None:
+    assert repo.list_all_fills(conn) == ()

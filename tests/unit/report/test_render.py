@@ -107,3 +107,53 @@ def test_render_missing_entry_decision_still_renders_trade() -> None:
 
     assert "ABCD" in output
     assert "見つかりません" in output
+
+
+def test_render_truncates_rationale_to_200_chars() -> None:
+    long_rationale = "x" * 201
+    entry_decision_id = "dec-long"
+    entry_decision = Decision(
+        id=entry_decision_id,
+        cycle_id="cycle-1",
+        decided_at=_NOW,
+        mode="paper",
+        ticker="ABCD",
+        action=Action.buy,
+        origin=Origin.llm,
+        confidence=Decimal("0.8"),
+        rationale=long_rationale,
+        evidence_mention_ids=("m-1",),
+        llm_model="claude-sonnet-5",
+        prompt_sha256="p" * 64,
+        response_sha256="r" * 64,
+        rule_set_sha256="ruleset-sha",
+        rule_check=RuleCheck.passed,
+        rule_check_reason="ok",
+        proposed_notional=Money(Decimal("70.00")),
+        reference_price=Price(Decimal("10")),
+    )
+    trade = Trade(
+        id="dec-long:dec-long-exit",
+        ticker="ABCD",
+        opened_at=_NOW,
+        closed_at=_NOW,
+        entry_decision_id=entry_decision_id,
+        exit_decision_ids=("dec-long-exit",),
+        exit_reason=ExitReason.stop_loss,
+        realized_pnl=Money(Decimal("-14.00")),
+        fees=Money(Decimal("0")),
+        holding_days=3,
+    )
+
+    output = render_report(
+        _metrics(), _ESTIMATE, (trade,), {entry_decision_id: entry_decision}, _PERIOD
+    )
+
+    assert "x" * 200 in output
+    assert "x" * 201 not in output
+
+
+def test_render_with_zero_open_positions_shows_placeholder() -> None:
+    output = render_report(_metrics(), _ESTIMATE, (), {}, _PERIOD)
+
+    assert "保有なし" in output

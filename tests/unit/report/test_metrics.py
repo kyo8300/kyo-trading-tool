@@ -143,6 +143,32 @@ def test_max_drawdown_is_zero_with_no_snapshots() -> None:
     assert metrics.max_drawdown_pct == Decimal("0.00")
 
 
+def test_max_drawdown_is_zero_when_equity_only_increases() -> None:
+    snapshots = (
+        _snapshot("2026-01-01", "500"),
+        _snapshot("2026-01-02", "520"),
+        _snapshot("2026-01-03", "540"),
+    )
+
+    metrics = compute((), (), snapshots, (), _PERIOD)
+
+    assert metrics.max_drawdown_pct == Decimal("0.00")
+
+
+def test_zero_pnl_trade_counts_as_neither_win_nor_loss() -> None:
+    trades = (
+        _trade("t-1", "20.00"),
+        _trade("t-2", "0.00"),
+        _trade("t-3", "-14.00"),
+    )
+
+    metrics = compute(trades, (), (), (), _PERIOD)
+
+    assert metrics.trade_count == 3
+    assert metrics.win_count == 1
+    assert metrics.loss_count == 1
+
+
 def test_exit_reason_counts_reflect_period_trades() -> None:
     trades = (
         _trade("t-1", "10.00", exit_reason=ExitReason.stop_loss),

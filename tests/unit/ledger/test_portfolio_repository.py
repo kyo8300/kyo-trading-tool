@@ -197,6 +197,41 @@ def test_upsert_equity_snapshot_peak_equity_is_max(conn) -> None:
     assert row["drawdown_pct"] == "9.62"
 
 
+def test_list_equity_snapshots_round_trips_oldest_first(conn) -> None:
+    with transaction(conn):
+        repo.upsert_equity_snapshot(
+            conn,
+            snapshot_date="2026-01-06",
+            mode="paper",
+            cash=Money(Decimal("410")),
+            positions_value=Money(Decimal("110")),
+            peak_equity=Money(Decimal("520")),
+            drawdown_pct=Decimal("0"),
+            taken_at=_NOW,
+        )
+    with transaction(conn):
+        repo.upsert_equity_snapshot(
+            conn,
+            snapshot_date="2026-01-05",
+            mode="paper",
+            cash=Money(Decimal("400")),
+            positions_value=Money(Decimal("100")),
+            peak_equity=Money(Decimal("500")),
+            drawdown_pct=Decimal("0"),
+            taken_at=_NOW,
+        )
+
+    snapshots = repo.list_equity_snapshots(conn)
+
+    assert [s.snapshot_date for s in snapshots] == ["2026-01-05", "2026-01-06"]
+    assert snapshots[0].equity == Money(Decimal("500"))
+    assert snapshots[1].equity == Money(Decimal("520"))
+
+
+def test_list_equity_snapshots_is_empty_with_no_snapshots(conn) -> None:
+    assert repo.list_equity_snapshots(conn) == ()
+
+
 def test_upsert_equity_snapshot_new_day_is_a_new_row(conn) -> None:
     with transaction(conn):
         repo.upsert_equity_snapshot(

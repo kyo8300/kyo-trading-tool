@@ -223,6 +223,112 @@ def test_report_shows_a_closed_trade(tmp_path: Path) -> None:
     assert "stop_loss" in result.output
 
 
+def test_report_excludes_trades_outside_from_to_range(tmp_path: Path) -> None:
+    from trader.domain.models import ExitReason, Trade
+
+    db_path = tmp_path / "trader.sqlite3"
+    rules_path = Path(__file__).parent.parent / "fixtures" / "rules" / "valid.yaml"
+    decision = _decision("dec-report-range", db_path)
+
+    conn = open_db(db_path).value
+    with transaction(conn):
+        portfolio_repo.insert_trade(
+            conn,
+            Trade(
+                id="dec-report-range:in-range-exit",
+                ticker="INRANGE",
+                opened_at=_NOW,
+                closed_at=_NOW,
+                entry_decision_id=decision.id,
+                exit_decision_ids=("in-range-exit",),
+                exit_reason=ExitReason.stop_loss,
+                realized_pnl=Money(Decimal("-14.00")),
+                fees=Money(Decimal("0")),
+                holding_days=3,
+            ),
+        )
+        portfolio_repo.insert_trade(
+            conn,
+            Trade(
+                id="dec-report-range:out-of-range-exit",
+                ticker="OUTRANGE",
+                opened_at=_NOW.replace(year=2025, month=1),
+                closed_at=_NOW.replace(year=2025, month=1),
+                entry_decision_id=decision.id,
+                exit_decision_ids=("out-of-range-exit",),
+                exit_reason=ExitReason.stop_loss,
+                realized_pnl=Money(Decimal("99.00")),
+                fees=Money(Decimal("0")),
+                holding_days=3,
+            ),
+        )
+    conn.close()
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--db",
+            str(db_path),
+            "--rules",
+            str(rules_path),
+            "--from",
+            "2026-01-01",
+            "--to",
+            "2026-01-31",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "INRANGE" in result.output
+    assert "OUTRANGE" not in result.output
+
+
+def test_report_without_a_database_exits_1(tmp_path: Path) -> None:
+    db_path = tmp_path / "does-not-exist.sqlite3"
+    rules_path = Path(__file__).parent.parent / "fixtures" / "rules" / "valid.yaml"
+
+    result = runner.invoke(app, ["report", "--db", str(db_path), "--rules", str(rules_path)])
+
+    assert result.exit_code == 1
+    assert "trader report:" in result.output
+
+
+def test_report_without_rules_exits_1(tmp_path: Path) -> None:
+    db_path = tmp_path / "trader.sqlite3"
+    open_db(db_path).value.close()
+    missing_rules_path = tmp_path / "does-not-exist.yaml"
+
+    result = runner.invoke(
+        app, ["report", "--db", str(db_path), "--rules", str(missing_rules_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "trader report:" in result.output
+
+
+def test_report_with_invalid_date_format_exits_1_with_a_human_message(tmp_path: Path) -> None:
+    db_path = tmp_path / "trader.sqlite3"
+    open_db(db_path).value.close()
+    rules_path = Path(__file__).parent.parent / "fixtures" / "rules" / "valid.yaml"
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--db",
+            str(db_path),
+            "--rules",
+            str(rules_path),
+            "--from",
+            "not-a-date",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "YYYY-MM-DD" in result.output
+
+
 def test_resume_when_not_halted_reports_not_halted_without_erroring(tmp_path: Path) -> None:
     db_path = tmp_path / "trader.sqlite3"
     open_db(db_path).value.close()
