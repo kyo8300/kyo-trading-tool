@@ -448,5 +448,5 @@ spec に根拠があるものだけを挙げる。「未確認」は隠さない
 
 ## 承認
 
-approved_by:
-approved_at:
+approved_by: kyo
+approved_at: 2026-09-14
