@@ -290,6 +290,12 @@ def evaluate_candidates(
                 analysis.response_sha256 or None,
             )
         else:
+            # `held_tickers` must grow as earlier proposals in this batch
+            # pass, so a later proposal in the same batch sees the tickers
+            # that would already be held once earlier buys execute (caps
+            # `max_concurrent_positions` and de-dupes a ticker proposed
+            # twice within one batch).
+            batch_held_tickers = set(held_tickers)
             for proposal in analysis.proposals:
                 if proposal.action != "buy":
                     decisions.append(
@@ -305,25 +311,26 @@ def evaluate_candidates(
                         )
                     )
                     continue
-                decisions.append(
-                    _buy_decision(
-                        proposal,
-                        cycle_id,
-                        now,
-                        mode,
-                        rule_set_sha256,
-                        analysis.llm_model,
-                        analysis.prompt_sha256 or None,
-                        analysis.response_sha256 or None,
-                        rules,
-                        limits,
-                        held_tickers,
-                        market_open,
-                        priced[proposal.ticker],
-                        avg_volumes[proposal.ticker],
-                        loss_breach,
-                    )
+                buy_decision = _buy_decision(
+                    proposal,
+                    cycle_id,
+                    now,
+                    mode,
+                    rule_set_sha256,
+                    analysis.llm_model,
+                    analysis.prompt_sha256 or None,
+                    analysis.response_sha256 or None,
+                    rules,
+                    limits,
+                    batch_held_tickers,
+                    market_open,
+                    priced[proposal.ticker],
+                    avg_volumes[proposal.ticker],
+                    loss_breach,
                 )
+                if buy_decision.rule_check is RuleCheck.passed:
+                    batch_held_tickers.add(proposal.ticker)
+                decisions.append(buy_decision)
 
     for decision in decisions:
         insert_result = insert_decision(conn, decision)

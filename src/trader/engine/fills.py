@@ -31,6 +31,7 @@ from trader.ledger.repository import (
     FillContext,
     insert_fill,
     list_fill_context_for_ticker_since,
+    list_fills,
     update_order_status,
 )
 from trader.ledger.trade_closer import OpenPosition, apply_fill
@@ -184,8 +185,20 @@ def poll_and_settle(
     poll_interval_s: int,
 ) -> Result[PollOutcome, FillsError]:
     """Poll `client_order_id` until it reaches a terminal status or times out,
-    recording every fill and applying it to the ledger as it arrives."""
-    recorded_qty = 0
+    recording every fill and applying it to the ledger as it arrives.
+
+    The already-recorded cumulative quantity/notional are seeded from
+    `order_id`'s existing `fills` rows (not assumed to be zero) so a
+    second `poll_and_settle` call for the same order -- rather than the
+    normal single call that loops internally until a terminal status --
+    still computes each new fill's incremental price correctly (R-18
+    review finding).
+    """
+    existing_fills = list_fills(conn, order_id)
+    recorded_qty = sum(f.qty.shares for f in existing_fills)
+    recorded_notional = Money(
+        sum((f.price.amount * f.qty.shares for f in existing_fills), start=Decimal(0))
+    )
     fills_recorded = 0
     last_status = OrderStatus.submitted
     elapsed = 0
@@ -198,12 +211,24 @@ def poll_and_settle(
 
         new_qty = broker_order.filled_qty.shares - recorded_qty
         if new_qty > 0 and broker_order.filled_avg_price is not None:
+            # `broker_order.filled_avg_price` is the broker's running
+            # average price across the *whole order so far*, not the price
+            # of just the newly-filled `new_qty` shares (R-18 review
+            # finding). Back out the incremental price from the delta
+            # between this poll's cumulative notional and what was already
+            # recorded, so a later fill at a different price does not get
+            # double-blended with the earlier one.
+            cumulative_notional = Money(
+                broker_order.filled_avg_price.amount * broker_order.filled_qty.shares
+            )
+            delta_notional = cumulative_notional - recorded_notional
+            delta_price = Price(delta_notional.amount / Decimal(new_qty))
             fill = Fill(
                 id=f"fill_{uuid.uuid4().hex}",
                 order_id=order_id,
                 filled_at=clock.now(),
                 qty=Quantity(new_qty),
-                price=broker_order.filled_avg_price,
+                price=delta_price,
                 fee=Money(Decimal(0)),
             )
             insert_result = insert_fill(conn, fill)
@@ -213,6 +238,7 @@ def poll_and_settle(
             if isinstance(settle_result, Err):
                 return settle_result
             recorded_qty = broker_order.filled_qty.shares
+            recorded_notional = cumulative_notional
             fills_recorded += 1
 
         if broker_order.status != last_status:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from decimal import ROUND_FLOOR, Decimal
 from typing import Final
 
 from trader.config.mode import TradingMode
@@ -37,6 +38,7 @@ class ApprovalError:
 
 
 _TOKEN: Final[object] = object()
+_HALF_CENT: Final[Decimal] = Decimal("0.005")
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,8 +92,16 @@ def _order_qty(decision: Decision) -> Result[Quantity, ApprovalError]:
     Both fields are set by the rule engine when it produces a `passed`
     buy/sell decision (`rules.entry_checks.check_entry` /
     `rules.exit_checks.check_exit`, floor division to whole shares -- same
-    derivation as `EntryPlan.qty`). A `passed` buy/sell decision without
-    both fields is a caller bug, not a normal input-validation case.
+    derivation as `EntryPlan.qty`). `proposed_notional` is a cent-quantized
+    `Money` (`ROUND_HALF_EVEN`, worst case off by half a cent from the true
+    `qty * reference_price`), so a plain `floor(notional / price)` can
+    undercount the share by one when that quantization rounded the stored
+    notional down across a share boundary (R-12 review finding, e.g. 7
+    shares @ 8.3333 = 58.3331 -> stored as 58.33 -> `floor(58.33/8.3333) ==
+    6`). Adding back half a cent before flooring corrects that without
+    changing genuinely-below-a-share amounts (e.g. 5.00 / 10.0000 stays 0
+    shares -- `Err`). A `passed` buy/sell decision without both fields is a
+    caller bug, not a normal input-validation case.
     """
     if decision.proposed_notional is None or decision.reference_price is None:
         return Err(
@@ -101,7 +111,11 @@ def _order_qty(decision: Decision) -> Result[Quantity, ApprovalError]:
         )
     if decision.reference_price.amount <= 0:
         return Err(ApprovalError(f"decision {decision.id} reference_price must be positive"))
-    shares = int(decision.proposed_notional.amount // decision.reference_price.amount)
+    shares = int(
+        (
+            (decision.proposed_notional.amount + _HALF_CENT) / decision.reference_price.amount
+        ).to_integral_value(rounding=ROUND_FLOOR)
+    )
     if shares <= 0:
         return Err(ApprovalError(f"decision {decision.id} sizes to zero shares"))
     return Ok(Quantity(shares))

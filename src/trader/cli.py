@@ -307,7 +307,7 @@ def approve(
     """Record a human (`kyo`) approval for a decision that passed rule checks (R-17)."""
     from datetime import datetime as dt
 
-    from trader.domain.clock import SystemClock
+    from trader.domain.clock import SystemClock, to_utc
     from trader.domain.result import Err
     from trader.engine.approval import record_human_approval
     from trader.ledger.db import open_db
@@ -321,7 +321,11 @@ def approve(
         raise typer.Exit(code=1)
 
     try:
-        parsed_expires_at = dt.fromisoformat(expires_at)
+        # Normalize a non-UTC-offset (or naive) `--expires-at` to the
+        # equivalent UTC instant (R-17 review finding): otherwise a
+        # `+09:00`-offset timestamp could be stored and later compared as
+        # if it were later than it actually is in absolute time.
+        parsed_expires_at = to_utc(dt.fromisoformat(expires_at))
     except ValueError:
         typer.echo(
             f"trader approve: --expires-at is not a valid ISO 8601 timestamp: {expires_at}",

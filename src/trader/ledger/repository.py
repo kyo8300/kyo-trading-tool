@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
+from trader.domain.clock import to_utc
 from trader.domain.models import (
     Action,
     Approval,
@@ -44,7 +45,17 @@ class LedgerCorruptionError(RuntimeError):
 
 
 def _dt_to_text(value: datetime) -> str:
-    return value.isoformat()
+    """Serialize `value` as its UTC ISO 8601 instant (R-17 review finding).
+
+    Every timestamp column is normalized to UTC before storage via
+    `domain.clock.to_utc` so stored strings are directly comparable both
+    lexicographically and, once parsed back with `_dt_from_text`, as
+    absolute instants -- a non-UTC-offset input (e.g. a CLI-supplied
+    `--expires-at +09:00`) can otherwise sort as "later" than a UTC `now`
+    purely because its date/time digits differ, even when it is earlier in
+    absolute time.
+    """
+    return to_utc(value).isoformat()
 
 
 def _dt_from_text(value: str) -> datetime:
@@ -309,17 +320,31 @@ def get_order(conn: sqlite3.Connection, order_id: str) -> Order | None:
 def find_valid_approval(
     conn: sqlite3.Connection, decision_id: str, now: datetime
 ) -> Approval | None:
-    """Return an unexpired approval for `decision_id`, if one exists (R-17)."""
-    row = conn.execute(
+    """Return the most recent unexpired approval for `decision_id`, if any (R-17).
+
+    `approved_at`/`expires_at` are stored (by `_dt_to_text`) as UTC ISO 8601
+    text, so they *could* be compared as raw text -- but the expiry check
+    here is instead done by parsing each candidate row's `expires_at` back
+    into a `datetime` (`_dt_from_text`) and comparing it to `now` as an
+    absolute instant, rather than relying on SQL text comparison (R-17
+    review finding: a caller-supplied `now` or a historically-stored value
+    that is not already UTC-normalized text would otherwise be able to
+    compare incorrectly).
+    """
+    rows = conn.execute(
         """
         SELECT * FROM approvals
-        WHERE decision_id = ? AND expires_at > ?
+        WHERE decision_id = ?
         ORDER BY approved_at DESC
-        LIMIT 1
         """,
-        (decision_id, _dt_to_text(now)),
-    ).fetchone()
-    return _row_to_approval(row) if row is not None else None
+        (decision_id,),
+    ).fetchall()
+    normalized_now = to_utc(now)
+    for row in rows:
+        approval = _row_to_approval(row)
+        if approval.expires_at > normalized_now:
+            return approval
+    return None
 
 
 def list_decisions(conn: sqlite3.Connection, cycle_id: str | None = None) -> tuple[Decision, ...]:

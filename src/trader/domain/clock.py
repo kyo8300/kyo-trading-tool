@@ -13,6 +13,24 @@ class Clock(Protocol):
     def now(self) -> datetime: ...
 
 
+def to_utc(value: datetime) -> datetime:
+    """Normalize `value` to an absolute UTC instant (R-17 review finding).
+
+    A naive `value` (no `tzinfo`) is assumed to already be UTC -- every
+    internal `Clock` in `src/` (`SystemClock`, `FixedClock`) always produces
+    tz-aware UTC datetimes, so the only source of a naive datetime is
+    operator input (e.g. the CLI `approve --expires-at` flag) that this
+    normalizes rather than silently misinterpreting in the local timezone.
+    An aware `value` with a non-UTC offset (e.g. `+09:00`) is converted to
+    the equivalent UTC instant, not just re-labeled, so downstream
+    comparisons/storage are on the same absolute timeline regardless of the
+    offset the caller supplied.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 @dataclass(frozen=True, slots=True)
 class SystemClock:
     """Real wall-clock time."""

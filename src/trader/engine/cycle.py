@@ -249,6 +249,25 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
     holdings_outcome = holdings_result.value
     decisions_count = len(holdings_outcome.decisions)
 
+    if holdings_outcome.market_errors:
+        # spec エラー処理: a held position whose price could not be fetched
+        # means the cycle cannot judge sells or value the portfolio, so no
+        # equity_snapshots write, no loss-limit/kill-switch evaluation
+        # against incomplete equity, and no new buys -- the whole cycle
+        # stops here as `market_unavailable` (R-19 review finding). Holding
+        # decisions already recorded above (e.g. exits on priced tickers)
+        # are kept.
+        return _finish(
+            conn,
+            cycle_id,
+            "market_unavailable",
+            "no price for held ticker(s): " + ", ".join(holdings_outcome.market_errors),
+            decisions_count,
+            0,
+            0,
+            deps.clock,
+        )
+
     account_result = deps.broker.account()
     if isinstance(account_result, Err):
         return _finish(
