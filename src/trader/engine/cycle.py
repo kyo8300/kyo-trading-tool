@@ -1,0 +1,395 @@
+"""Cycle orchestration (R-8, N-10): the single entry point tying holdings,
+candidates, approval, execution, and fills together for one `run-cycle`.
+
+Order: acquire the lock file -> open a `cycles` row -> if halted, evaluate
+holdings only (decisions are kept, nothing is submitted) -> fetch the market
+clock (a failure here means no new buys and no equity snapshot this cycle)
+-> evaluate holdings -> compute equity and upsert today's snapshot -> check
+daily/weekly/drawdown loss limits (a breach fires the kill switch and ends
+the cycle) -> evaluate candidates -> if the market is closed, stop (decisions
+are kept, nothing is submitted) -> for every passed buy/sell decision,
+resolve approval, execute, and poll for fills -> close the `cycles` row.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import sqlite3
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+from typing import IO, Literal
+
+from trader.analysis.analyst import LlmClient
+from trader.broker.broker import Broker
+from trader.config.mode import TradingMode
+from trader.domain.clock import Clock
+from trader.domain.models import Action, RuleCheck, Trade
+from trader.domain.money import Money
+from trader.domain.result import Err, Ok, Result
+from trader.engine.approval import resolve_approval
+from trader.engine.candidates import CandidatesOutcome, evaluate_candidates
+from trader.engine.fills import poll_and_settle
+from trader.engine.holdings import HoldingsOutcome, evaluate_holdings
+from trader.engine.kill_switch import is_halted
+from trader.engine.kill_switch import trigger as trigger_kill_switch
+from trader.engine.order_executor import execute
+from trader.ledger.portfolio_repository import (
+    finish_cycle,
+    insert_cycle,
+    list_equity_snapshots,
+    list_positions,
+    list_trades,
+    set_engine_state,
+    upsert_equity_snapshot,
+)
+from trader.ledger.source_repository import list_mentions
+from trader.market.data_provider import MarketClock, MarketDataProvider
+from trader.rules import loss_limits
+from trader.rules.schema import DerivedLimits, RuleSet
+
+_SERENITY_SOURCE_ID = "serenity"
+_LAST_CYCLE_ID_KEY = "last_cycle_id"
+
+CycleStatus = Literal["ok", "halted", "market_unavailable", "error"]
+
+
+@dataclass(frozen=True, slots=True)
+class CycleError:
+    """A human-readable cycle error (N-6)."""
+
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class CycleOutcome:
+    """What happened during one `run_cycle` call."""
+
+    cycle_id: str
+    outcome: CycleStatus
+    decisions: int
+    orders: int
+    fills: int
+    error_summary: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CycleDeps:
+    """Everything one `run_cycle` call needs, injected for testability (N-9)."""
+
+    mode: TradingMode
+    rules: RuleSet
+    limits: DerivedLimits
+    rule_set_sha256: str
+    conn: sqlite3.Connection
+    broker: Broker
+    market: MarketDataProvider
+    llm: LlmClient | None
+    clock: Clock
+    capital: Money
+    poll_timeout_s: int = 60
+    poll_interval_s: int = 2
+    sleep: Callable[[int], None] = time.sleep
+    lock_path: Path | None = None
+
+
+def _acquire_lock(lock_path: Path) -> Result[IO[str], CycleError]:
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return Err(CycleError("別のサイクルが実行中です"))
+    return Ok(handle)
+
+
+def _release_lock(handle: IO[str]) -> None:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _prior_peak_equity(conn: sqlite3.Connection, capital: Money, today: str) -> Money:
+    prior = [s for s in list_equity_snapshots(conn) if s.snapshot_date < today]
+    if not prior:
+        return capital
+    return prior[-1].peak_equity
+
+
+def _realized_totals(trades: tuple[Trade, ...], now: datetime) -> tuple[Money, Money]:
+    today = loss_limits.trading_day(now)
+    week_start = loss_limits.trading_week_start(now)
+    realized_today = Money(Decimal(0))
+    realized_week = Money(Decimal(0))
+    for trade in trades:
+        trade_day = loss_limits.trading_day(trade.closed_at)
+        if trade_day == today:
+            realized_today = realized_today + trade.realized_pnl
+        if trade_day >= week_start:
+            realized_week = realized_week + trade.realized_pnl
+    return realized_today, realized_week
+
+
+def _finish(
+    conn: sqlite3.Connection,
+    cycle_id: str,
+    outcome: CycleStatus,
+    error_summary: str | None,
+    decisions: int,
+    orders: int,
+    fills: int,
+    clock: Clock,
+) -> Result[CycleOutcome, CycleError]:
+    finish_result = finish_cycle(conn, cycle_id, clock.now(), outcome, error_summary)
+    if isinstance(finish_result, Err):
+        return Err(CycleError(finish_result.error.message))
+    if outcome != "error":
+        set_engine_state(conn, _LAST_CYCLE_ID_KEY, cycle_id)
+    return Ok(
+        CycleOutcome(
+            cycle_id=cycle_id,
+            outcome=outcome,
+            decisions=decisions,
+            orders=orders,
+            fills=fills,
+            error_summary=error_summary,
+        )
+    )
+
+
+def run_cycle(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
+    """Run exactly one decision/order cycle (R-8)."""
+    if deps.lock_path is None:
+        return _run_locked(deps)
+
+    lock_result = _acquire_lock(deps.lock_path)
+    if isinstance(lock_result, Err):
+        return lock_result
+    handle = lock_result.value
+    try:
+        return _run_locked(deps)
+    finally:
+        _release_lock(handle)
+
+
+def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
+    conn = deps.conn
+    started_at = deps.clock.now()
+    cycle_id = f"cycle_{uuid.uuid4().hex}"
+
+    insert_result = insert_cycle(conn, cycle_id, started_at, deps.mode.value)
+    if isinstance(insert_result, Err):
+        return Err(CycleError(insert_result.error.message))
+
+    if is_halted(conn):
+        holdings_result = evaluate_holdings(
+            conn,
+            list_positions(conn),
+            deps.market,
+            deps.rules,
+            deps.clock,
+            cycle_id,
+            deps.rule_set_sha256,
+            deps.mode.value,
+        )
+        decisions_count = (
+            len(holdings_result.value.decisions) if isinstance(holdings_result, Ok) else 0
+        )
+        return _finish(
+            conn, cycle_id, "halted", "engine is halted", decisions_count, 0, 0, deps.clock
+        )
+
+    market_clock_result = deps.market.market_clock()
+    if isinstance(market_clock_result, Err):
+        return _finish(
+            conn,
+            cycle_id,
+            "market_unavailable",
+            market_clock_result.error.message,
+            0,
+            0,
+            0,
+            deps.clock,
+        )
+    market_clock = market_clock_result.value
+
+    positions = list_positions(conn)
+    holdings_result = evaluate_holdings(
+        conn,
+        positions,
+        deps.market,
+        deps.rules,
+        deps.clock,
+        cycle_id,
+        deps.rule_set_sha256,
+        deps.mode.value,
+    )
+    if isinstance(holdings_result, Err):
+        return _finish(conn, cycle_id, "error", holdings_result.error.message, 0, 0, 0, deps.clock)
+    holdings_outcome = holdings_result.value
+    decisions_count = len(holdings_outcome.decisions)
+
+    account_result = deps.broker.account()
+    if isinstance(account_result, Err):
+        return _finish(
+            conn,
+            cycle_id,
+            "market_unavailable",
+            account_result.error.message,
+            decisions_count,
+            0,
+            0,
+            deps.clock,
+        )
+    cash = account_result.value.cash
+    equity = cash + holdings_outcome.positions_value
+
+    now = deps.clock.now()
+    today = loss_limits.trading_day(now).isoformat()
+    prior_peak = _prior_peak_equity(conn, deps.capital, today)
+    peak_equity = Money(max(prior_peak.amount, equity.amount))
+    drawdown_pct = (
+        (peak_equity.amount - equity.amount) / peak_equity.amount * Decimal(100)
+        if peak_equity.amount > 0
+        else Decimal(0)
+    )
+    snapshot_result = upsert_equity_snapshot(
+        conn,
+        today,
+        deps.mode.value,
+        cash,
+        holdings_outcome.positions_value,
+        peak_equity,
+        drawdown_pct,
+        now,
+    )
+    if isinstance(snapshot_result, Err):
+        return _finish(
+            conn,
+            cycle_id,
+            "error",
+            snapshot_result.error.message,
+            decisions_count,
+            0,
+            0,
+            deps.clock,
+        )
+
+    realized_today, realized_week = _realized_totals(list_trades(conn), now)
+    breach = loss_limits.evaluate(
+        deps.limits,
+        realized_today,
+        holdings_outcome.unrealized_pnl,
+        realized_week,
+        equity,
+        peak_equity,
+    )
+    if breach is not None:
+        kill_result = trigger_kill_switch(breach, deps.broker, conn, deps.clock)
+        if isinstance(kill_result, Err):
+            return _finish(
+                conn,
+                cycle_id,
+                "error",
+                kill_result.error.message,
+                decisions_count,
+                0,
+                0,
+                deps.clock,
+            )
+        return _finish(conn, cycle_id, "halted", breach.reason, decisions_count, 0, 0, deps.clock)
+
+    held_tickers = {p.ticker for p in positions}
+    mentions = list_mentions(conn, _SERENITY_SOURCE_ID)
+    candidates_result = evaluate_candidates(
+        conn,
+        mentions,
+        held_tickers,
+        deps.market,
+        deps.llm,
+        deps.rules,
+        deps.limits,
+        deps.clock,
+        cycle_id,
+        deps.rule_set_sha256,
+        deps.mode.value,
+        None,
+        market_clock.is_open,
+    )
+    if isinstance(candidates_result, Err):
+        return _finish(
+            conn,
+            cycle_id,
+            "error",
+            candidates_result.error.message,
+            decisions_count,
+            0,
+            0,
+            deps.clock,
+        )
+    candidates_outcome = candidates_result.value
+    decisions_count += len(candidates_outcome.decisions)
+
+    if not market_clock.is_open:
+        return _finish(conn, cycle_id, "ok", None, decisions_count, 0, 0, deps.clock)
+
+    orders_count, fills_count = _execute_passed_decisions(
+        deps, conn, holdings_outcome, candidates_outcome, market_clock
+    )
+
+    return _finish(
+        conn, cycle_id, "ok", None, decisions_count, orders_count, fills_count, deps.clock
+    )
+
+
+def _execute_passed_decisions(
+    deps: CycleDeps,
+    conn: sqlite3.Connection,
+    holdings_outcome: HoldingsOutcome,
+    candidates_outcome: CandidatesOutcome,
+    market_clock: MarketClock,
+) -> tuple[int, int]:
+    orders_count = 0
+    fills_count = 0
+    all_decisions = (*holdings_outcome.decisions, *candidates_outcome.decisions)
+    for decision in all_decisions:
+        if decision.rule_check is not RuleCheck.passed or decision.action not in (
+            Action.buy,
+            Action.sell,
+        ):
+            continue
+
+        approval_result = resolve_approval(decision, deps.mode, conn, deps.clock, market_clock)
+        if isinstance(approval_result, Err):
+            continue
+
+        exec_result = execute(approval_result.value, conn, deps.broker, deps.clock, deps.mode)
+        if isinstance(exec_result, Err):
+            continue
+        order = exec_result.value
+        orders_count += 1
+
+        exit_reason = holdings_outcome.exit_reasons.get(decision.id)
+        poll_result = poll_and_settle(
+            conn,
+            deps.broker,
+            deps.clock,
+            deps.sleep,
+            order.client_order_id,
+            order.id,
+            decision,
+            order.side,
+            exit_reason,
+            deps.poll_timeout_s,
+            deps.poll_interval_s,
+        )
+        if isinstance(poll_result, Ok):
+            fills_count += poll_result.value.fills_recorded
+
+    return orders_count, fills_count

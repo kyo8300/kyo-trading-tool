@@ -166,10 +166,124 @@ def ingest(
     typer.echo(f"trader ingest: {result.value}")
 
 
+_DEFAULT_LOCK_PATH = "var/run-cycle.lock"
+
+
 @app.command("run-cycle")
 def run_cycle() -> None:
-    """Run a single decision/order cycle."""
-    _not_implemented("run-cycle")
+    """Run a single decision/order cycle (R-8). Refuses to run under
+    `TRADER_ENV=test` (N-9); tests call `trader.engine.cycle.run_cycle` directly."""
+    import time
+
+    from trader.analysis.llm_client import AnthropicClient
+    from trader.broker.alpaca_broker import AlpacaBroker
+    from trader.config.settings import LiveSettings, PaperSettings, load_settings
+    from trader.domain.clock import SystemClock
+    from trader.domain.money import Money
+    from trader.domain.result import Err
+    from trader.engine.cycle import CycleDeps
+    from trader.engine.cycle import run_cycle as run_cycle_engine
+    from trader.ledger.db import open_db
+    from trader.market.alpaca_data import AlpacaMarketData
+    from trader.rules import derive_limits, load_rules, verify_lock
+    from trader.rules.lock import sha256_of_file
+
+    if os.environ.get("TRADER_ENV") == "test":
+        typer.echo("trader run-cycle: テスト環境では実行しません (TRADER_ENV=test)", err=True)
+        raise typer.Exit(code=1)
+
+    settings_result = load_settings(os.environ)
+    if isinstance(settings_result, Err):
+        typer.echo(f"trader run-cycle: {settings_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    settings = settings_result.value
+
+    rules_path = settings.TRADER_RULES_PATH
+    lock_path = rules_path.parent / "trading-rules.lock"
+    verify_result = verify_lock(rules_path, lock_path)
+    if isinstance(verify_result, Err):
+        typer.echo(f"trader run-cycle: {verify_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+
+    rules_result = load_rules(rules_path)
+    if isinstance(rules_result, Err):
+        typer.echo(f"trader run-cycle: {rules_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    rule_set = rules_result.value
+    limits = derive_limits(rule_set)
+
+    sha_result = sha256_of_file(rules_path)
+    if isinstance(sha_result, Err):
+        typer.echo(f"trader run-cycle: {sha_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    rule_set_sha256 = sha_result.value
+
+    db_result = open_db(settings.TRADER_DB_PATH)
+    if isinstance(db_result, Err):
+        typer.echo(f"trader run-cycle: {db_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    conn = db_result.value
+
+    if isinstance(settings, PaperSettings):
+        broker_result = AlpacaBroker.create(
+            settings.mode, settings.ALPACA_PAPER_TRADE_KEY, settings.ALPACA_PAPER_TRADE_SECRET
+        )
+        market = AlpacaMarketData.create(
+            settings.ALPACA_PAPER_READ_KEY, settings.ALPACA_PAPER_READ_SECRET, mode=settings.mode
+        )
+    else:
+        assert isinstance(settings, LiveSettings)  # noqa: S101 -- exhaustiveness, not a test
+        broker_result = AlpacaBroker.create(
+            settings.mode, settings.ALPACA_LIVE_TRADE_KEY, settings.ALPACA_LIVE_TRADE_SECRET
+        )
+        market = AlpacaMarketData.create(
+            settings.ALPACA_LIVE_READ_KEY, settings.ALPACA_LIVE_READ_SECRET, mode=settings.mode
+        )
+    if isinstance(broker_result, Err):
+        conn.close()
+        typer.echo(f"trader run-cycle: {broker_result.error.message}", err=True)
+        raise typer.Exit(code=1)
+    broker = broker_result.value
+
+    llm = AnthropicClient.create(settings.ANTHROPIC_API_KEY, settings.ANTHROPIC_MODEL)
+
+    deps = CycleDeps(
+        mode=settings.mode,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=rule_set_sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        # `AnthropicClient` duck-types `LlmClient` (has `.model` / `.complete`), but
+        # mypy treats a frozen dataclass's slot as read-only against the protocol's
+        # plain (mutable-looking) attribute declaration -- a known variance quirk,
+        # not a real type mismatch.
+        llm=llm,  # type: ignore[arg-type]
+        clock=SystemClock(),
+        capital=Money(rule_set.capital_usd),
+        sleep=time.sleep,
+        lock_path=Path(os.environ.get("TRADER_LOCK_PATH", _DEFAULT_LOCK_PATH)),
+    )
+
+    try:
+        result = run_cycle_engine(deps)
+    finally:
+        conn.close()
+
+    if isinstance(result, Err):
+        typer.echo(f"trader run-cycle: {result.error.message}", err=True)
+        raise typer.Exit(code=1)
+
+    outcome = result.value
+    typer.echo(
+        f"trader run-cycle: cycle {outcome.cycle_id} outcome={outcome.outcome} "
+        f"decisions={outcome.decisions} orders={outcome.orders} fills={outcome.fills}"
+    )
+    if outcome.error_summary:
+        typer.echo(f"  detail: {outcome.error_summary}")
+    if outcome.outcome == "error":
+        raise typer.Exit(code=1)
 
 
 @app.command("approve")
