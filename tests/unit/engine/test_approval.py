@@ -218,6 +218,30 @@ def test_live_mode_rejects_an_unexpired_system_approval(conn) -> None:
     assert isinstance(result, Err)
 
 
+def test_order_qty_matches_the_actual_held_share_count_for_a_quantized_notional(conn) -> None:
+    """R-12/R-13 review finding (approval.py:104): `proposed_notional` is a
+    `Money` quantized to the cent, so `floor(proposed_notional / price)` can
+    be off by one share versus the actual position size when the true
+    notional (qty * price) has more precision than a cent.
+
+    7 shares @ 8.3333 = 58.3331, which `Money` quantizes to 58.33 (a rule-exit
+    decision, e.g. a full stop-loss sell of a 7-share position, carries
+    exactly this `proposed_notional`/`reference_price` pair -- see
+    `engine.holdings._sell_qty` / `notional = Money(price.amount * qty.shares)`).
+    `floor(58.33 / 8.3333) == 6`, one share short of the 7 actually held.
+    `resolve_approval` must size the order to the 7 shares the decision was
+    actually about, not silently under-size it.
+    """
+    decision = _decision(
+        action=Action.sell,
+        proposed_notional=Money(Decimal("58.33")),
+        reference_price=Price(Decimal("8.3333")),
+    )
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Ok)
+    assert result.value.qty.shares == 7
+
+
 def test_order_qty_of_zero_when_notional_is_below_reference_price_is_rejected(conn) -> None:
     """`_order_qty` = floor(proposed_notional / reference_price); when that
     floors to 0 shares, no order can be sized, so `resolve_approval` must

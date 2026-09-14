@@ -121,6 +121,47 @@ def test_approve_with_expires_at_records_a_kyo_approval(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_approve_with_a_non_utc_offset_expires_at_is_correctly_treated_as_expired(
+    tmp_path: Path,
+) -> None:
+    """R-17 review finding (repository.py:313 `find_valid_approval`): the
+    stored `expires_at` is compared to `now` as raw ISO 8601 *text*
+    (`WHERE expires_at > ?`), not as an absolute instant. An approval
+    recorded with a non-UTC offset in `--expires-at` sorts as "later"
+    purely because its date digits differ, even when it is, in absolute
+    time, already expired.
+
+    `--expires-at 2026-01-06T06:00:00+09:00` is exactly
+    `2026-01-05T21:00:00+00:00` in absolute time. `now=2026-01-05T22:00:00Z`
+    is one hour *after* that -- the approval must be expired
+    (`find_valid_approval` -> `None`) -- but lexicographically the stored
+    string `"2026-01-06T06:00:00+09:00"` is greater than
+    `"2026-01-05T22:00:00+00:00"` (the `now` text), so the current
+    string-comparison query wrongly reports it as still valid.
+    """
+    db_path = tmp_path / "trader.sqlite3"
+    decision = _decision("dec-tz", db_path)
+
+    result = runner.invoke(
+        app,
+        [
+            "approve",
+            decision.id,
+            "--expires-at",
+            "2026-01-06T06:00:00+09:00",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    conn = open_db(db_path).value
+    now = datetime(2026, 1, 5, 22, 0, tzinfo=UTC)
+    approval = repo.find_valid_approval(conn, decision.id, now)
+    assert approval is None
+    conn.close()
+
+
 def test_status_reports_halted_positions_and_last_cycle(tmp_path: Path) -> None:
     from trader.domain.models import Position
     from trader.domain.money import Quantity

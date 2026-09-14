@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from trader.broker.broker import BrokerOrder
+from trader.domain.clock import FixedClock
 from trader.domain.models import (
     Action,
     Approval,
@@ -25,6 +27,8 @@ from trader.domain.models import (
     with_status,
 )
 from trader.domain.money import Money, Price, Quantity
+from trader.domain.result import Ok
+from trader.engine.fills import poll_and_settle
 from trader.ledger import portfolio_repository as portfolio_repo
 from trader.ledger import repository as repo
 from trader.ledger.db import open_db, transaction
@@ -305,3 +309,86 @@ def test_list_all_fills_round_trips_fills_across_orders(conn) -> None:
 
 def test_list_all_fills_is_empty_with_no_fills(conn) -> None:
     assert repo.list_all_fills(conn) == ()
+
+
+def test_partial_fill_delta_records_incremental_price_not_brokers_cumulative_avg(
+    conn,
+) -> None:
+    """R-18 review finding (fills.py:200): `poll_and_settle` records every
+    new (cumulative-delta) fill at `broker_order.filled_avg_price` --
+    but that field is the *broker's running average price across the whole
+    order so far*, not the price of just the newly-filled shares. For a
+    partial fill followed by a further fill at a different price, this
+    double-counts the first fill's contribution into the second fill's
+    price.
+
+    1st poll: filled_qty=3, filled_avg_price=10.00 (order average so far).
+    2nd poll: filled_qty=7 (delta +4), filled_avg_price=11.00 (order
+    average across all 7 shares). The true price of the 4 incremental
+    shares is `(7*11.00 - 3*10.00) / 4 = 11.75`, not the broker's
+    already-blended 11.00 -- so `fills` row 2 must have `qty=4`,
+    `price=11.75`, and the resulting `positions.avg_cost` (blending
+    3 @ 10.00 and 4 @ 11.75) must be exactly `11.0000`.
+    """
+
+    class _TwoStepBroker:
+        """A minimal `Broker` double: `get_order` returns a fixed sequence
+        of (cumulative) broker-reported fill states, one per call."""
+
+        def __init__(self) -> None:
+            self._responses = [
+                BrokerOrder(
+                    broker_order_id="b-1",
+                    client_order_id="order_dec-1",
+                    status=OrderStatus.partially_filled,
+                    filled_qty=Quantity(3),
+                    filled_avg_price=Price(Decimal("10.00")),
+                    updated_at=_NOW,
+                ),
+                BrokerOrder(
+                    broker_order_id="b-1",
+                    client_order_id="order_dec-1",
+                    status=OrderStatus.filled,
+                    filled_qty=Quantity(7),
+                    filled_avg_price=Price(Decimal("11.00")),
+                    updated_at=_NOW,
+                ),
+            ]
+
+        def get_order(self, client_order_id: str):
+            return Ok(self._responses.pop(0))
+
+    order = _order("order-partial-avg", "order_dec-1")
+    with transaction(conn):
+        repo.insert_order(conn, order)
+        repo.update_order_status(conn, "order-partial-avg", OrderStatus.submitted)
+
+    decision = repo.get_decision(conn, "dec-1")
+
+    poll_result = poll_and_settle(
+        conn,
+        _TwoStepBroker(),
+        FixedClock(_NOW),
+        lambda _s: None,
+        "order_dec-1",
+        "order-partial-avg",
+        decision,
+        Side.buy,
+        None,
+        poll_timeout_s=10,
+        poll_interval_s=1,
+    )
+
+    assert isinstance(poll_result, Ok)
+    assert poll_result.value.fills_recorded == 2
+
+    fills = repo.list_fills(conn, "order-partial-avg")
+    assert len(fills) == 2
+    assert fills[0].qty.shares == 3
+    assert fills[0].price.amount == Decimal("10.00")
+    assert fills[1].qty.shares == 4
+    assert fills[1].price.amount == Decimal("11.75")
+
+    position = portfolio_repo.get_position(conn, "ABCD")
+    assert position is not None
+    assert position.avg_cost.amount == Decimal("11.0000")

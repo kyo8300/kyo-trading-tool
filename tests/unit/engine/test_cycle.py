@@ -411,6 +411,65 @@ def test_stop_loss_sell_closes_trade_with_expected_pnl(tmp_path: Path) -> None:
     conn.close()
 
 
+def test_stop_loss_sell_at_a_four_decimal_price_sells_the_full_held_quantity(
+    tmp_path: Path,
+) -> None:
+    """R-12/R-13 review finding (approval.py:104, `_order_qty`): a stop-loss
+    `Decision`'s `proposed_notional` is `qty * price` quantized to the cent
+    (`engine.holdings._sell_qty`/`notional`). For a 4-decimal price
+    (7 shares @ 8.3333 = 58.3331 -> Money("58.33")),
+    `floor(58.33 / 8.3333) == 6`, one share short of the 7 actually held --
+    the sell order must still be sized to close the entire position (7
+    shares), leaving no residual position and exactly one closed trade."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+
+    opened_at = _NOW - timedelta(days=10)
+    position = Position(
+        ticker="ZZZZ",
+        qty=Quantity(7),
+        avg_cost=Price(Decimal("10.00")),
+        opened_at=opened_at,
+        high_watermark=Price(Decimal("10.00")),
+        partial_tp_done=False,
+    )
+    upsert_result = upsert_position(conn, position)
+    assert isinstance(upsert_result, Ok)
+
+    market = FakeMarketData(prices={"ZZZZ": Price(Decimal("8.3333"))}, bars={}, clock=_OPEN_CLOCK)
+    broker = _ImmediateFillBroker(fill_price=Price(Decimal("8.3333")))
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=None,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+    assert outcome.outcome == "ok"
+    assert outcome.orders == 1
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].qty.shares == 7
+
+    positions = list_positions(conn)
+    assert positions == ()
+
+    trades = list_trades(conn)
+    assert len(trades) == 1
+    conn.close()
+
+
 @dataclass
 class _ErrLlm:
     """A `LlmClient` whose `complete` always fails (T-13 test plan: LLM Err)."""
@@ -510,6 +569,97 @@ def test_market_clock_error_skips_equity_snapshot_and_orders(tmp_path: Path) -> 
     assert outcome.fills == 0
     assert broker.submit_call_count == 0
     assert list_equity_snapshots(conn) == ()
+    conn.close()
+
+
+def test_a_held_positions_unpriceable_ticker_skips_the_cycle_instead_of_halting(
+    tmp_path: Path,
+) -> None:
+    """R-19/エラー処理 review finding (cycle.py:249, holdings.py:80): when
+    `market.latest_price` fails for a *held* ticker (market open, so
+    `market_clock()` itself succeeds), `evaluate_holdings` records the
+    failure in `market_errors` but still returns `Ok` -- so `run_cycle`
+    currently ignores it and proceeds to price the (incomplete)
+    `positions_value`, upsert `equity_snapshots`, and run
+    `loss_limits`/the kill switch against that incomplete equity, and it
+    also still evaluates new-buy candidates.
+
+    Per spec エラー処理 (market data failure -> cannot judge sells or value
+    the portfolio, so no new buys; holdings are re-evaluated next cycle;
+    equity_snapshots is not updated this cycle) -- a held position whose
+    price cannot be fetched must make the *whole* cycle `market_unavailable`: no
+    `equity_snapshots` write, no kill switch (even though the incomplete
+    equity here would fabricate a huge apparent drawdown against a
+    generously high prior peak), and no orders.
+    """
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    snapshot_result = upsert_equity_snapshot(
+        conn,
+        "2026-09-13",
+        "paper",
+        Money(Decimal("500.00")),
+        Money(Decimal("0")),
+        Money(Decimal("500.00")),
+        Decimal("0"),
+        _NOW - timedelta(days=1),
+    )
+    assert isinstance(snapshot_result, Ok)
+
+    opened_at = _NOW - timedelta(days=10)
+    position = Position(
+        ticker="ZZZZ",
+        qty=Quantity(7),
+        avg_cost=Price(Decimal("10.00")),
+        opened_at=opened_at,
+        high_watermark=Price(Decimal("10.00")),
+        partial_tp_done=False,
+    )
+    upsert_result = upsert_position(conn, position)
+    assert isinstance(upsert_result, Ok)
+
+    # ZZZZ has no configured price -> latest_price is Err (holdings.py
+    # skips it into market_errors). AAPL is otherwise a perfectly good buy
+    # candidate, to prove new buys are blocked too.
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10"))}, bars={"AAPL": _bars("AAPL")}, clock=_OPEN_CLOCK
+    )
+    broker = FakeBroker().with_account(
+        BrokerAccount(cash=Money(Decimal("10.00")), equity=Money(Decimal("10.00")))
+    )
+    llm = _FakeLlm(ticker="AAPL")
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    outcome = result.value
+    assert outcome.outcome == "market_unavailable"
+    assert outcome.orders == 0
+    assert outcome.fills == 0
+    assert broker.submit_call_count == 0
+    assert not kill_switch.is_halted(conn)
+    snapshots = list_equity_snapshots(conn)
+    assert len(snapshots) == 1
+    assert snapshots[0].snapshot_date == "2026-09-13"
+
+    decisions = list_decisions(conn, outcome.cycle_id)
+    assert not any(d.ticker == "AAPL" and d.action.value == "buy" for d in decisions)
     conn.close()
 
 
