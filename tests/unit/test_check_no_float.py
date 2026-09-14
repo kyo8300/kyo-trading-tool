@@ -67,3 +67,56 @@ def test_check_paths_scans_directory_recursively(tmp_path: Path) -> None:
     _write(nested, "f.py", "x = float(1)\n")
     violations = check_paths([tmp_path])
     assert len(violations) == 1
+
+
+def test_detects_float_nested_in_generic_annotation(tmp_path: Path) -> None:
+    """AC-23 boundary: `list[float]` must be caught, not just bare `float`."""
+    file_path = _write(tmp_path, "g.py", "def f(xs: list[float]) -> None:\n    pass\n")
+    violations = check_file(file_path)
+    assert len(violations) == 1
+    assert "xs" in violations[0].message
+
+
+def test_detects_float_inside_typing_optional(tmp_path: Path) -> None:
+    """AC-23 boundary: `typing.Optional[float]` must be caught."""
+    file_path = _write(
+        tmp_path,
+        "h.py",
+        "import typing\n\n\ndef f(x: typing.Optional[float]) -> None:\n    pass\n",
+    )
+    violations = check_file(file_path)
+    assert len(violations) == 1
+    assert "x" in violations[0].message
+
+
+def test_does_not_flag_attribute_named_float(tmp_path: Path) -> None:
+    """AC-23 boundary: an attribute access/call named `float` (e.g. a method on
+    some object, not the builtin) must not be a false positive."""
+    file_path = _write(
+        tmp_path,
+        "i.py",
+        "class Money:\n    def float(self) -> None:\n        pass\n\n\nm = Money()\nm.float()\n",
+    )
+    violations = check_file(file_path)
+    assert violations == []
+
+
+def test_does_not_flag_identifier_containing_float_substring(tmp_path: Path) -> None:
+    """AC-23 boundary: names like `float_price` must not falsely trigger the
+    builtin-name check."""
+    file_path = _write(
+        tmp_path,
+        "j.py",
+        "from decimal import Decimal\n\n\n"
+        "def f(float_price: Decimal) -> Decimal:\n"
+        "    return float_price\n",
+    )
+    violations = check_file(file_path)
+    assert violations == []
+
+
+def test_check_paths_reports_multiple_violations_across_files(tmp_path: Path) -> None:
+    _write(tmp_path, "k.py", "a: float = 1.0\n")
+    _write(tmp_path, "l.py", "b = float('2.0')\n")
+    violations = check_paths([tmp_path])
+    assert len(violations) == 2
