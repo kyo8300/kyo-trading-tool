@@ -256,7 +256,7 @@ def test_selling_without_a_position_is_an_error() -> None:
     assert is_err(result)
 
 
-def test_AC20_same_day_close_has_zero_holding_days() -> None:
+def test_ac20_same_day_close_has_zero_holding_days() -> None:
     """AC-20: a position opened and closed on the same calendar day."""
     opened_at = datetime(2026, 1, 5, 14, 0, tzinfo=UTC)
     closed_at = datetime(2026, 1, 5, 20, 0, tzinfo=UTC)
@@ -281,7 +281,7 @@ def test_AC20_same_day_close_has_zero_holding_days() -> None:
     assert update.trade.holding_days == 0
 
 
-def test_AC20_holding_days_uses_calendar_date_not_elapsed_hours() -> None:
+def test_ac20_holding_days_uses_calendar_date_not_elapsed_hours() -> None:
     """Crossing a UTC midnight boundary counts as 1 calendar day even though
     less than 24 hours elapsed between the fills."""
     opened_at = datetime(2026, 1, 5, 23, 50, tzinfo=UTC)
@@ -308,7 +308,7 @@ def test_AC20_holding_days_uses_calendar_date_not_elapsed_hours() -> None:
     assert update.trade.holding_days == 1
 
 
-def test_AC20_fees_accumulate_across_partial_sells() -> None:
+def test_ac20_fees_accumulate_across_partial_sells() -> None:
     """Two 0.50 fees across a partial take-profit and a trailing-stop sell
     accumulate to 1.00 on the closed trade."""
     opened = apply_fill(None, _fill("f1", 10, "10"), _decision("dec-buy"), Side.buy, _NOW).value
@@ -346,7 +346,7 @@ def test_AC20_fees_accumulate_across_partial_sells() -> None:
     assert trade.exit_decision_ids == ("dec-partial", "dec-trailing")
 
 
-def test_AC20_additional_buy_computes_weighted_average_cost_to_four_places() -> None:
+def test_ac20_additional_buy_computes_weighted_average_cost_to_four_places() -> None:
     """7 @10 then 3 @12 averages to 10.6000, quantized to 4 places, and
     retains the first fill's opened_at."""
     opened = apply_fill(None, _fill("f1", 7, "10"), _decision("dec-buy-1"), Side.buy, _NOW).value
@@ -363,7 +363,7 @@ def test_AC20_additional_buy_computes_weighted_average_cost_to_four_places() -> 
     assert update.position.opened_at == _NOW
 
 
-def test_AC20_high_watermark_is_the_max_seen_price_after_an_additional_buy() -> None:
+def test_ac20_high_watermark_is_the_max_seen_price_after_an_additional_buy() -> None:
     """A second buy above the current high_watermark should raise it, not
     silently keep the pre-buy value (trailing-stop math depends on this)."""
     opened = apply_fill(None, _fill("f1", 7, "10"), _decision("dec-buy-1"), Side.buy, _NOW).value
@@ -378,7 +378,7 @@ def test_AC20_high_watermark_is_the_max_seen_price_after_an_additional_buy() -> 
     assert update.position.high_watermark == Price(Decimal("12"))
 
 
-def test_AC20_fee_can_turn_a_profitable_price_move_into_a_loss() -> None:
+def test_ac20_fee_can_turn_a_profitable_price_move_into_a_loss() -> None:
     """price > avg_cost, but the fee outweighs the small per-share gain."""
     opened = apply_fill(None, _fill("f1", 1, "10"), _decision("dec-buy"), Side.buy, _NOW).value
     position = opened.position
@@ -400,7 +400,7 @@ def test_AC20_fee_can_turn_a_profitable_price_move_into_a_loss() -> None:
     assert update.trade.realized_pnl == Money(Decimal("-0.95"))
 
 
-def test_AC20_zero_qty_fill_is_a_pinned_no_op_not_a_silent_error() -> None:
+def test_ac20_zero_qty_fill_is_a_pinned_no_op_not_a_silent_error() -> None:
     """Current documented behavior: a zero-quantity sell fill does not
     reduce the position and only subtracts its fee. This test pins that
     decision so a future change to reject zero-qty fills is a deliberate
@@ -423,7 +423,7 @@ def test_AC20_zero_qty_fill_is_a_pinned_no_op_not_a_silent_error() -> None:
     assert update.position.qty == Quantity(5)
 
 
-def test_AC20_result_is_a_new_object_and_input_position_is_unchanged() -> None:
+def test_ac20_result_is_a_new_object_and_input_position_is_unchanged() -> None:
     """apply_fill must not mutate the `Position` passed in (N-7 immutability)."""
     opened = apply_fill(None, _fill("f1", 7, "10"), _decision("dec-buy-1"), Side.buy, _NOW).value
     original_position = opened.position
