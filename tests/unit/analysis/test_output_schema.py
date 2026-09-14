@@ -4,6 +4,7 @@ become decisions (AC-7, R-5, R-7)."""
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 from trader.analysis.output_schema import parse_llm_response
 from trader.domain.result import Err, Ok
@@ -117,3 +118,126 @@ def test_empty_proposals_list_is_valid() -> None:
 
     assert isinstance(result, Ok)
     assert result.value.proposals == ()
+
+
+def test_confidence_exactly_zero_and_one_are_accepted() -> None:
+    low = _valid_payload()
+    low["proposals"][0]["confidence"] = "0"  # type: ignore[index]
+    high = _valid_payload()
+    high["proposals"][0]["confidence"] = "1"  # type: ignore[index]
+
+    result_low = parse_llm_response(json.dumps(low), CANDIDATES)
+    result_high = parse_llm_response(json.dumps(high), CANDIDATES)
+
+    assert isinstance(result_low, Ok)
+    assert result_low.value.proposals[0].confidence == Decimal("0")
+    assert isinstance(result_high, Ok)
+    assert result_high.value.proposals[0].confidence == Decimal("1")
+
+
+def test_confidence_just_below_zero_is_rejected() -> None:
+    payload = _valid_payload()
+    payload["proposals"][0]["confidence"] = "-0.01"  # type: ignore[index]
+
+    result = parse_llm_response(json.dumps(payload), CANDIDATES)
+
+    assert isinstance(result, Err)
+
+
+def test_confidence_just_above_one_is_rejected() -> None:
+    payload = _valid_payload()
+    payload["proposals"][0]["confidence"] = "1.01"  # type: ignore[index]
+
+    result = parse_llm_response(json.dumps(payload), CANDIDATES)
+
+    assert isinstance(result, Err)
+
+
+def test_confidence_string_is_converted_to_decimal() -> None:
+    payload = _valid_payload()
+    payload["proposals"][0]["confidence"] = "0.5"  # type: ignore[index]
+
+    result = parse_llm_response(json.dumps(payload), CANDIDATES)
+
+    assert isinstance(result, Ok)
+    proposal = result.value.proposals[0]
+    assert proposal.confidence == Decimal("0.5")
+    assert isinstance(proposal.confidence, Decimal)
+
+
+def test_empty_rationale_is_rejected() -> None:
+    payload = _valid_payload()
+    payload["proposals"][0]["rationale"] = ""  # type: ignore[index]
+
+    result = parse_llm_response(json.dumps(payload), CANDIDATES)
+
+    assert isinstance(result, Err)
+
+
+def test_non_string_evidence_mention_ids_are_rejected() -> None:
+    payload = _valid_payload()
+    payload["proposals"][0]["evidence_mention_ids"] = [1, 2]  # type: ignore[index]
+
+    result = parse_llm_response(json.dumps(payload), CANDIDATES)
+
+    assert isinstance(result, Err)
+
+
+def test_unknown_top_level_field_is_rejected() -> None:
+    for key, value in (
+        ("rules", {}),
+        ("max_notional_per_ticker_pct", "15"),
+        ("capital_usd", "500"),
+    ):
+        payload = _valid_payload()
+        payload[key] = value
+
+        result = parse_llm_response(json.dumps(payload), CANDIDATES)
+
+        assert isinstance(result, Err), f"expected Err for top-level key {key!r}"
+
+
+def test_quantity_specifying_keys_in_proposal_are_rejected() -> None:
+    for key, value in (("qty", 10), ("notional", "75.00"), ("shares", 5)):
+        payload = _valid_payload()
+        payload["proposals"][0][key] = value  # type: ignore[index]
+
+        result = parse_llm_response(json.dumps(payload), CANDIDATES)
+
+        assert isinstance(result, Err), f"expected Err for proposal key {key!r}"
+
+
+def test_non_json_body_error_message_excludes_the_body() -> None:
+    body = "definitely not json: secret-looking-content-xyz"
+
+    result = parse_llm_response(body, CANDIDATES)
+
+    assert isinstance(result, Err)
+    assert body not in result.error.message
+    assert "secret-looking-content-xyz" not in result.error.message
+
+
+def test_one_candidate_outside_list_rejects_the_whole_response() -> None:
+    payload = _valid_payload()
+    payload["proposals"].append(  # type: ignore[attr-defined]
+        {
+            "ticker": "UNKNOWN",
+            "action": "hold",
+            "confidence": "0.2",
+            "rationale": "not in candidates",
+            "evidence_mention_ids": [],
+        }
+    )
+
+    result = parse_llm_response(json.dumps(payload), CANDIDATES)
+
+    assert isinstance(result, Err)
+
+
+def test_lowercase_ticker_does_not_match_uppercase_candidate() -> None:
+    payload = _valid_payload()
+    payload["proposals"][0]["ticker"] = "aapl"  # type: ignore[index]
+
+    result = parse_llm_response(json.dumps(payload), CANDIDATES)
+
+    assert isinstance(result, Err)

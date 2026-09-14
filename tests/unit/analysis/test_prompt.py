@@ -95,3 +95,56 @@ def test_prompt_never_contains_trading_rules_string() -> None:
     assert "trading-rules" not in prompt.system
     assert "trading-rules" not in prompt.user
     assert "trading-rules" not in summary
+
+
+def test_rules_summary_includes_pct_and_stop_loss_and_excluded_tickers() -> None:
+    rule_set, limits = _rule_set_and_limits()
+
+    summary = rules_summary(rule_set, limits)
+
+    assert "15%" in summary
+    assert "-15" in summary  # stop_loss_pct
+    assert "Excluded tickers" in summary
+
+
+def test_build_prompt_includes_20_daily_bars_and_average_volume() -> None:
+    rule_set, limits = _rule_set_and_limits()
+    summary = rules_summary(rule_set, limits)
+    bars = tuple(
+        Bar(
+            ticker="AAPL",
+            date=date(2026, 9, day),
+            open=Price(Decimal("10.00")),
+            high=Price(Decimal("10.50")),
+            low=Price(Decimal("9.50")),
+            close=Price(Decimal("10.00")),
+            volume=200_000,
+        )
+        for day in range(1, 26)
+    )
+
+    prompt = build_prompt(summary, (), {"AAPL": bars}, ["AAPL"])
+
+    assert "most recent 20" in prompt.user
+    assert "avg daily volume: 200000" in prompt.user
+
+
+def test_build_prompt_with_empty_candidates_does_not_raise() -> None:
+    rule_set, limits = _rule_set_and_limits()
+    summary = rules_summary(rule_set, limits)
+
+    prompt = build_prompt(summary, (), {}, [])
+
+    assert "(none)" in prompt.user
+
+
+def test_build_prompt_is_deterministic_for_the_same_input() -> None:
+    rule_set, limits = _rule_set_and_limits()
+    summary = rules_summary(rule_set, limits)
+    evidences = (_evidence("AAPL", last14=5, prior14=0),)
+    bars_by_ticker = {"AAPL": _bars("AAPL")}
+
+    prompt_a = build_prompt(summary, evidences, bars_by_ticker, ["AAPL"])
+    prompt_b = build_prompt(summary, evidences, bars_by_ticker, ["AAPL"])
+
+    assert prompt_a == prompt_b

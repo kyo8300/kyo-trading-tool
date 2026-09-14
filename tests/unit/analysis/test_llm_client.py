@@ -3,6 +3,7 @@ hashes wired up correctly (AC-24, N-4)."""
 
 from __future__ import annotations
 
+import hashlib
 from decimal import Decimal
 from typing import Any
 
@@ -196,6 +197,113 @@ def test_analyst_propose_skips_without_calling_llm_when_no_candidates() -> None:
     assert messages.calls == 0
 
 
+def test_server_error_500_is_retried() -> None:
+    messages = _FlakyMessages([_status_error(500), _FakeMessage('{"proposals": []}')])
+    client = _client(messages)
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Ok)
+    assert messages.calls == 2
+
+
+def test_unauthorized_401_is_not_retried() -> None:
+    messages = _FlakyMessages([_status_error(401), _FakeMessage('{"proposals": []}')])
+    client = _client(messages)
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Err)
+    assert result.error.retryable is False
+    assert messages.calls == 1
+
+
+def test_not_found_404_is_not_retried() -> None:
+    messages = _FlakyMessages([_status_error(404), _FakeMessage('{"proposals": []}')])
+    client = _client(messages)
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Err)
+    assert result.error.retryable is False
+    assert messages.calls == 1
+
+
+def test_empty_content_returns_err() -> None:
+    class _EmptyMessage:
+        def __init__(self) -> None:
+            self.content: list[Any] = []
+
+    messages = _FlakyMessages([_EmptyMessage()])
+    client = _client(messages)
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Err)
+    assert messages.calls == 1
+
+
+def test_content_without_text_block_returns_err() -> None:
+    class _NoTextBlock:
+        pass
+
+    class _MessageWithNoTextBlock:
+        def __init__(self) -> None:
+            self.content = [_NoTextBlock()]
+
+    messages = _FlakyMessages([_MessageWithNoTextBlock()])
+    client = _client(messages)
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Err)
+    assert messages.calls == 1
+
+
+def test_hash_matches_hashlib_sha256_of_response_text() -> None:
+    response_text = '{"proposals": []}'
+    messages = _FlakyMessages([_FakeMessage(response_text)])
+    client = _client(messages)
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Ok)
+    expected_prompt_hash = hashlib.sha256(
+        (_prompt().system + "\n" + _prompt().user).encode("utf-8")
+    ).hexdigest()
+    expected_response_hash = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+    assert result.value.prompt_sha256 == expected_prompt_hash
+    assert result.value.response_sha256 == expected_response_hash
+
+
+def test_error_message_never_includes_api_key_or_response_body() -> None:
+    secret_key = "sk-super-secret-value-12345"  # noqa: S105 (test-only fake credential)
+    response_body = "SENSITIVE_RESPONSE_BODY_CONTENT"
+    response = httpx.Response(
+        status_code=503, request=_REQUEST, json={"error": {"message": response_body}}
+    )
+    status_error = APIStatusError(response_body, response=response, body={"error": {}})
+    messages = _FlakyMessages([status_error, status_error])
+    kwargs_sink: dict[str, Any] = {}
+
+    def factory(**kwargs: Any) -> _FakeAnthropic:
+        kwargs_sink.update(kwargs)
+        return _FakeAnthropic(messages, **kwargs)
+
+    client = AnthropicClient.create(
+        SecretStr(secret_key),
+        "claude-test-model",
+        client_factory=factory,
+        sleep=lambda _delay: None,
+    )
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Err)
+    assert secret_key not in result.error.message
+    assert response_body not in result.error.message
+
+
 def test_analyst_propose_returns_proposals_on_success() -> None:
     payload = (
         '{"proposals": [{"ticker": "AAPL", "action": "buy", "confidence": "0.6", '
@@ -209,3 +317,4 @@ def test_analyst_propose_returns_proposals_on_success() -> None:
     assert result.skipped_reason is None
     assert len(result.proposals) == 1
     assert result.proposals[0].ticker == "AAPL"
+    assert result.llm_model == "claude-test-model"
