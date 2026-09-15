@@ -31,6 +31,21 @@ $ uv run pytest tests/unit -q
 N passed in X.XXs
 ```
 
+## Deploy
+
+Deploy 先は **kyo の手元マシン（Linux / macOS）で cron 実行**（費用 $0。VPS は不要）。
+「production」= 実 `.env`（Alpaca paper キー）を置いた手元マシンで cron が回っている状態を指す。
+デプロイは AI が実行できない手作業なので、deployer は以下の手順を案内するだけで、実行は kyo が行う。
+
+1. `git pull` で `main` を最新にし、`uv sync`
+2. `.env.example` をコピーして `.env` を作り、`ALPACA_PAPER_*` 4 つと `ANTHROPIC_API_KEY` を入れる（`TRADER_MODE` は空 = paper）
+3. `rules/trading-rules.yaml` の `approved_by` / `approved_at` を記入 → `uv run trader rules approve` → `rules/trading-rules.lock` を commit
+4. yan-labs の `data/aleabitoreddit_tweets.json` → `data/sources/serenity/tweets.json`、`ticker_stats.txt` → 同ディレクトリにコピー → `uv run trader ingest`
+5. `deploy/crontab.example` を参考に crontab を登録（`scripts/run_cycle.sh` が `.env` を読んで `trader run-cycle` を実行し、`var/run-cycle.log` に追記）
+6. 市場時間内に 1 サイクル走ったら `uv run trader status` / `uv run trader report` で AC-32 / AC-33 を確認
+
+live モードへの切り替え（`TRADER_MODE=live` + `ALPACA_LIVE_*` + `TRADER_LIVE_CONFIRM`）は本 spec のスコープ外。別 spec で扱う。
+
 ## Conventions
 
 詳細は `.claude/rules/` を参照。要点:
@@ -56,7 +71,7 @@ N passed in X.XXs
                            │ tester   → TDD、受入基準の verify 実行
                            │ reviewer → REVIEW.md の3パス。APPROVE / REJECT(builderへ) / HALT(人間へ)
                            └ Stop hook: 受入基準が全部通るまで終了をブロック（/goal 併用）
-[自動]  deployer ── Deploy 先は未定。production は hook で人間承認必須
+[自動]  deployer ── Deploy 先は kyo の手元マシン（cron）。`## Deploy` 参照。production は hook で人間承認必須
 [人間]  成果チェック
 ```
 

@@ -1,0 +1,23 @@
+# kyo の手元マシン（Linux / macOS）で市場時間内に 15 分間隔で run-cycle を回す（spec R-8）。
+# インストール: crontab -e で下記を貼り、REPO を実パスに置き換える。
+#
+# Linux (cronie / vixie-cron) は CRON_TZ で米東部時間をそのまま書ける。
+# macOS の cron は CRON_TZ 非対応なので、下の「JST 版」を使う（夏時間で 1 時間ずれるので年 2 回見直す）。
+#
+# 市場時間外に走っても trader run-cycle は発注しない（判断のみ）が、LLM 呼び出しの費用はかかるので
+# 時間帯は市場時間（9:30〜16:00 ET）に寄せている。
+
+REPO=/path/to/kyo-trading-tool
+
+# --- Linux 版（米東部時間で指定） ---
+CRON_TZ=America/New_York
+30,45 9   * * 1-5  $REPO/scripts/run_cycle.sh
+*/15  10-15 * * 1-5  $REPO/scripts/run_cycle.sh
+0     16  * * 1-5  $REPO/scripts/run_cycle.sh
+
+# --- macOS 版（JST で指定。夏時間 EDT: 9:30〜16:00 ET = 22:30〜05:00 JST 翌日） ---
+# 30,45 22  * * 1-5  $REPO/scripts/run_cycle.sh
+# */15  23  * * 1-5  $REPO/scripts/run_cycle.sh
+# */15  0-4 * * 2-6  $REPO/scripts/run_cycle.sh
+# 0     5   * * 2-6  $REPO/scripts/run_cycle.sh
+# 冬時間（EST、11 月〜3 月）は上記を 1 時間後ろにずらす（23:30 開始、06:00 終了）。

@@ -26,3 +26,12 @@ __pycache__/
 .idea/
 .vscode/
 *.log
+
+# ai-auto-trader (T-1)
+data/
+var/
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

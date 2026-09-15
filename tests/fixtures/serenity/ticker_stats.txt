@@ -1,0 +1,4 @@
+# ticker mention counts (sample, first token per line is the ticker)
+AAPL 12 mentions
+TSLA 8 mentions
+GME 5 mentions

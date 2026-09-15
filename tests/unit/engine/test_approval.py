@@ -1,0 +1,290 @@
+"""T-12 / AC-16: paper auto-approval, live approval lookup and expiry (R-17)."""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+
+from trader.config.mode import TradingMode
+from trader.domain.clock import FixedClock
+from trader.domain.models import Action, Approval, Approver, Decision, Origin, RuleCheck
+from trader.domain.money import Money, Price
+from trader.domain.result import Err, Ok
+from trader.engine.approval import ApprovedOrderRequest, record_human_approval, resolve_approval
+from trader.ledger import portfolio_repository as portfolio_repo
+from trader.ledger import repository as repo
+from trader.ledger.db import open_db, transaction
+from trader.market.data_provider import MarketClock
+
+_NOW = datetime(2026, 1, 5, 15, 0, tzinfo=UTC)
+_NEXT_CLOSE = datetime(2026, 1, 5, 21, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def conn(tmp_path: Path):
+    connection = open_db(tmp_path / "trader.sqlite3").value
+    with transaction(connection):
+        portfolio_repo.insert_rule_set(
+            connection,
+            sha256="ruleset-sha",
+            approved_by="kyo",
+            approved_at="2026-01-01T00:00:00+00:00",
+            capital_usd=Money(Decimal("500")),
+            content_yaml="capital_usd: '500'\n",
+        )
+        portfolio_repo.insert_cycle(connection, cycle_id="cycle-1", started_at=_NOW, mode="paper")
+    yield connection
+    connection.close()
+
+
+def _decision(**overrides: object) -> Decision:
+    base = dict(
+        id="dec-1",
+        cycle_id="cycle-1",
+        decided_at=_NOW,
+        mode="paper",
+        ticker="ABCD",
+        action=Action.buy,
+        origin=Origin.llm,
+        confidence=Decimal("0.8"),
+        rationale="rising mentions",
+        evidence_mention_ids=("m-1",),
+        llm_model="claude-sonnet-5",
+        prompt_sha256="p" * 64,
+        response_sha256="r" * 64,
+        rule_set_sha256="ruleset-sha",
+        rule_check=RuleCheck.passed,
+        rule_check_reason="notional 75.00 <= limit 75.00 (15% of 500)",
+        proposed_notional=Money(Decimal("75.00")),
+        reference_price=Price(Decimal("10.0000")),
+    )
+    base.update(overrides)
+    return Decision(**base)  # type: ignore[arg-type]
+
+
+_MARKET_CLOCK = MarketClock(is_open=True, next_open=_NOW, next_close=_NEXT_CLOSE)
+
+
+def test_rejected_decision_never_resolves_to_an_approval(conn) -> None:
+    decision = _decision(rule_check=RuleCheck.rejected, rule_check_reason="notional too high")
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+def test_paper_mode_auto_approves_with_system_approver(conn) -> None:
+    decision = _decision()
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Ok)
+    req = result.value
+    assert isinstance(req, ApprovedOrderRequest)
+    assert req.approval.approver is Approver.system
+    assert req.approval.expires_at == _NEXT_CLOSE
+    assert req.qty.shares == 7
+    assert req.client_order_id == "order_dec-1"
+
+
+def test_live_mode_without_any_approval_is_rejected(conn) -> None:
+    decision = _decision(mode="live")
+    result = resolve_approval(decision, TradingMode.live, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+def test_live_mode_with_expired_approval_is_rejected(conn) -> None:
+    decision = _decision(mode="live")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+        repo.insert_approval(
+            conn,
+            Approval(
+                id="appr-expired",
+                decision_id=decision.id,
+                approver=Approver.kyo,
+                approved_at=_NOW - timedelta(days=2),
+                expires_at=_NOW - timedelta(days=1),
+            ),
+        )
+    result = resolve_approval(decision, TradingMode.live, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+def test_live_mode_with_valid_kyo_approval_succeeds(conn) -> None:
+    decision = _decision(mode="live")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+        repo.insert_approval(
+            conn,
+            Approval(
+                id="appr-valid",
+                decision_id=decision.id,
+                approver=Approver.kyo,
+                approved_at=_NOW,
+                expires_at=_NEXT_CLOSE,
+            ),
+        )
+    result = resolve_approval(decision, TradingMode.live, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Ok)
+    assert result.value.approval.approver is Approver.kyo
+
+
+def test_record_human_approval_inserts_a_kyo_approval(conn) -> None:
+    decision = _decision(mode="live")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+
+    result = record_human_approval(conn, decision.id, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Ok)
+    approval = result.value
+    assert approval.approver is Approver.kyo
+    assert approval.expires_at == _NEXT_CLOSE
+
+    stored = repo.find_valid_approval(conn, decision.id, _NOW)
+    assert stored is not None
+    assert stored.approver is Approver.kyo
+
+
+def test_record_human_approval_rejects_unknown_decision(conn) -> None:
+    result = record_human_approval(conn, "no-such-decision", FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+def test_record_human_approval_rejects_a_failed_rule_check(conn) -> None:
+    decision = _decision(id="dec-2", rule_check=RuleCheck.rejected, rule_check_reason="too big")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+
+    result = record_human_approval(conn, decision.id, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+def test_live_mode_rejects_approval_expiring_at_exactly_now(conn) -> None:
+    """AC-16 boundary: `expires_at == now` is expired, not valid (repository
+    filters `expires_at > now` strictly)."""
+    decision = _decision(mode="live")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+        repo.insert_approval(
+            conn,
+            Approval(
+                id="appr-boundary",
+                decision_id=decision.id,
+                approver=Approver.kyo,
+                approved_at=_NOW - timedelta(hours=1),
+                expires_at=_NOW,
+            ),
+        )
+    result = resolve_approval(decision, TradingMode.live, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+def test_live_mode_accepts_approval_expiring_one_second_from_now(conn) -> None:
+    """AC-16 boundary: `expires_at == now + 1s` is still valid."""
+    decision = _decision(mode="live")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+        repo.insert_approval(
+            conn,
+            Approval(
+                id="appr-boundary-ok",
+                decision_id=decision.id,
+                approver=Approver.kyo,
+                approved_at=_NOW - timedelta(hours=1),
+                expires_at=_NOW + timedelta(seconds=1),
+            ),
+        )
+    result = resolve_approval(decision, TradingMode.live, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Ok)
+
+
+def test_live_mode_rejects_an_unexpired_system_approval(conn) -> None:
+    """AC-16: a `system` approval (as auto-created in paper mode) is never
+    valid in live mode, even if it is unexpired."""
+    decision = _decision(mode="live")
+    with transaction(conn):
+        repo.insert_decision(conn, decision)
+        repo.insert_approval(
+            conn,
+            Approval(
+                id="appr-system",
+                decision_id=decision.id,
+                approver=Approver.system,
+                approved_at=_NOW,
+                expires_at=_NEXT_CLOSE,
+            ),
+        )
+    result = resolve_approval(decision, TradingMode.live, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+def test_order_qty_matches_the_actual_held_share_count_for_a_quantized_notional(conn) -> None:
+    """R-12/R-13 review finding (approval.py:104): `proposed_notional` is a
+    `Money` quantized to the cent, so `floor(proposed_notional / price)` can
+    be off by one share versus the actual position size when the true
+    notional (qty * price) has more precision than a cent.
+
+    7 shares @ 8.3333 = 58.3331, which `Money` quantizes to 58.33 (a rule-exit
+    decision, e.g. a full stop-loss sell of a 7-share position, carries
+    exactly this `proposed_notional`/`reference_price` pair -- see
+    `engine.holdings._sell_qty` / `notional = Money(price.amount * qty.shares)`).
+    `floor(58.33 / 8.3333) == 6`, one share short of the 7 actually held.
+    `resolve_approval` must size the order to the 7 shares the decision was
+    actually about, not silently under-size it.
+    """
+    decision = _decision(
+        action=Action.sell,
+        proposed_notional=Money(Decimal("58.33")),
+        reference_price=Price(Decimal("8.3333")),
+    )
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Ok)
+    assert result.value.qty.shares == 7
+
+
+def test_order_qty_of_zero_when_notional_is_below_reference_price_is_rejected(conn) -> None:
+    """`_order_qty` = floor(proposed_notional / reference_price); when that
+    floors to 0 shares, no order can be sized, so `resolve_approval` must
+    return `Err` rather than proceed to a 0-share order."""
+    decision = _decision(
+        proposed_notional=Money(Decimal("5.00")),
+        reference_price=Price(Decimal("10.0000")),
+    )
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)
+
+
+@pytest.mark.parametrize(
+    ("notional", "price", "expected_qty"),
+    [
+        (Decimal("75.00"), Decimal("10.0000"), 7),
+        (Decimal("58.33"), Decimal("8.3333"), 7),
+        (Decimal("74.00"), Decimal("2.0001"), 37),
+    ],
+)
+def test_order_qty_rounds_the_half_cent_quantization_error_without_inflating_shares(
+    conn, notional: Decimal, price: Decimal, expected_qty: int
+) -> None:
+    """R-12: `_order_qty` adds back half a cent before flooring so a
+    cent-quantized `proposed_notional` never under-counts the true share
+    count, but it must not round a boundary case up to an extra share
+    either (e.g. 75.00 / 10.0000 stays 7, not 8)."""
+    decision = _decision(
+        action=Action.sell,
+        proposed_notional=Money(notional),
+        reference_price=Price(price),
+    )
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Ok)
+    assert result.value.qty.shares == expected_qty
+
+
+def test_order_qty_of_9_99_over_10_still_floors_to_zero_not_one_share(conn) -> None:
+    """R-12 boundary: the half-cent correction must not turn a genuinely
+    sub-share notional (9.99 / 10 = 0.999 shares) into 1 share."""
+    decision = _decision(
+        proposed_notional=Money(Decimal("9.99")),
+        reference_price=Price(Decimal("10")),
+    )
+    result = resolve_approval(decision, TradingMode.paper, conn, FixedClock(_NOW), _MARKET_CLOCK)
+    assert isinstance(result, Err)

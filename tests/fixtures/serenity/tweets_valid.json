@@ -1,0 +1,32 @@
+[
+  {
+    "id": "1001",
+    "created_at": "2026-09-10T10:00:00Z",
+    "text": "Loving $AAPL right now, thesis intact",
+    "url": "https://x.com/user/status/1001"
+  },
+  {
+    "id": "1002",
+    "created_at": "2026-09-05T09:00:00Z",
+    "text": "$AAPL and $TSLA both getting attention today",
+    "url": "https://x.com/user/status/1002"
+  },
+  {
+    "id": "1003",
+    "created_at": "2026-08-20T08:00:00Z",
+    "text": "$TSLA still strong, holding",
+    "url": "https://x.com/user/status/1003"
+  },
+  {
+    "id": "1004",
+    "created_at": "2026-07-01T08:00:00Z",
+    "text": "$GME resurgence talk again, also some $XYZ hype",
+    "url": "https://x.com/user/status/1004"
+  },
+  {
+    "id": "1005",
+    "created_at": "2026-09-12T11:00:00Z",
+    "text": "$GME watch closely this week",
+    "url": null
+  }
+]

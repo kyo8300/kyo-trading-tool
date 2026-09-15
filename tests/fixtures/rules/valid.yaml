@@ -1,0 +1,62 @@
+approved_by: "kyo"          # kyo が記入（trader rules approve 時に必須）
+approved_at: "2026-09-14"
+
+# 運用資金（USD）。paper でも live 予定額と同じ額にして、paper 成績と live 成績を同じ土俵で比較できるようにする。
+# 既定 $500（約 7.5 万円）: 実弾で全額失っても生活に影響しない額、かつ 1 銘柄 15% = $75 で Serenity 銘柄（多くが $5〜$60）を
+# 整数株で買える下限付近。
+# kyo が承認時に変更できる。$300〜$1,000 の範囲なら以下の比率は変えなくてよい。$300 未満だと 1 銘柄 $45 未満になり
+# 買える銘柄が減るので、position.max_concurrent_positions を 3 に減らすことを推奨（1 銘柄 25% になる）。
+capital_usd: "500"
+
+position:
+  # capital の 15%。5 銘柄で 75% 稼働、残り 25% は現金バッファ（スリッページ・端数・翌日の追加買いの余地）。
+  max_notional_per_ticker_pct: "15"
+  # 分散と資金効率の折衷。増やすと 1 銘柄あたりが小さくなり、整数株で買える銘柄が減る。
+  max_concurrent_positions: 5
+  # 永久塩漬け防止の上限。Serenity のテーゼは 6〜12 ヶ月だが、結果を計測するために期限で強制クローズして記録する。
+  # 120 日 = 約 4 ヶ月 = テーゼ期間の下限の 2/3。paper の数週間で到達する想定ではなく、live での安全弁。
+  max_holding_days: 120
+
+exit:
+  # 対象銘柄は 1 日 15〜25% 動く。-8% 等の一般的な値はノイズで狩られる。-15% は「1 日の揺れの上限」に近く、
+  # それを超えたらテーゼ崩れとみなす水準。1 ポジションの最大損失 = 1 銘柄上限 15% × 損切り 15% = capital の 2.25%。
+  stop_loss_pct: "-15"
+  # フォロワー殺到で急騰した分を半分確定し、残り半分でテーゼの 6〜12 ヶ月を追う。
+  partial_take_profit_pct: "30"
+  partial_take_profit_fraction: "0.5"
+  # 部分利確後の残り半分に適用するトレーリングストップ（説明は本文）。20% は対象銘柄の日次変動幅より広く、
+  # 1 日の揺れで狩られにくい値。
+  trailing_stop_pct: "20"
+
+loss_limits:
+  # capital の 3%。1 ポジションの損切り 2.25% + スリッページ ≒ 1 回の損切り。同日 2 回目の損切りで止まる
+  # （「悪い日」に損切りが連鎖するのを防ぐ）。
+  max_daily_loss_pct: "3"
+  # capital の 6%。週に損切り 2〜3 回で止まる。
+  max_weekly_loss_pct: "6"
+  # 口座全体の評価額（現金 + 保有評価額）が過去最高評価額から 15% 下がったら停止。
+  # 日次・週次は「短期の連鎖」を止める基準、ドローダウンは「じわじわ負け続けている = 作戦が機能していない」を
+  # 止める基準で役割が違う。15% = 週次上限 6% の 2.5 週分。
+  max_drawdown_pct: "15"
+
+entry:
+  # 流動性の下限。薄い銘柄は cost_assumptions のスリッページ 0.5% が成り立たない。
+  min_price_usd: "2"                   # ペニー株除外
+  min_avg_daily_volume: 200000         # 直近 20 日平均の出来高（株）
+  excluded_tickers: []
+
+# R-23 実弾期待値の係数（決定値。live ブローカー確定時に commission_* と fx_cost_pct_one_way を合わせる）
+cost_assumptions:
+  # 小型株の成行注文の想定（片道）。entry.min_avg_daily_volume 20 万株が前提。
+  slippage_pct_per_side: "0.5"
+  # 約定代金に対する手数料率。Alpaca: "0" / moomoo: "0.132"（上限 $22、commission_cap_usd で表現）/ ウィブル: 要確認。
+  commission_pct: "0"
+  commission_cap_usd: ""               # 空 = 上限なし。moomoo なら "22"
+  # 注文あたりの固定手数料。SEC/FINRA fee 等の実額は fills.fee に記録するのでここには含めない。
+  commission_usd_per_order: "0"
+  # 入出金時の USD/JPY コスト（片道、概算）。
+  # - Alpaca（海外送金）: 銀行の固定送金手数料 数千円 + 為替スプレッド。capital $500 では固定手数料だけで 5% 以上に相当し、
+  #   成績を食う。live を Alpaca にするのはこの点でも不利で、国内業者（円入金）が本命。
+  # - 国内業者（円入金、為替スプレッド 25 銭/USD 程度）: 約 0.25%。
+  # 初期値は両者の間の保守的な "1.0" を置く（paper 段階の概算用）。live 業者が決まったら実コストに合わせる。
+  fx_cost_pct_one_way: "1.0"
