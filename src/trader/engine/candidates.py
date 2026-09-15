@@ -54,14 +54,17 @@ def _select_candidates(
     held_tickers: Collection[str],
     excluded_tickers: Collection[str],
 ) -> list[str]:
-    tickers = [
-        evidence.ticker
+    eligible = [
+        evidence
         for evidence in evidences
         if evidence.stats.mention_count_last_14d > 0
         and evidence.ticker not in held_tickers
         and evidence.ticker not in excluded_tickers
     ]
-    return tickers[:_MAX_CANDIDATES]
+    # Most-discussed first so the cap keeps the strongest signals, not the
+    # alphabetically-earliest tickers; ticker breaks ties deterministically.
+    ranked = sorted(eligible, key=lambda e: (-e.stats.mention_count_last_14d, e.ticker))
+    return [evidence.ticker for evidence in ranked[:_MAX_CANDIDATES]]
 
 
 def _skip_decision(
