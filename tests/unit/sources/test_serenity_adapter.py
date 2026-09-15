@@ -153,3 +153,34 @@ def test_ingest_cli_accepts_valid_file_and_is_idempotent(tmp_path: Path) -> None
     finally:
         conn.close()
     assert mentions_after_second == mentions_after_first
+
+
+def test_yan_labs_field_names_are_accepted() -> None:
+    """The real archive uses `createdAtISO` / `createdAt` / `sourceUrl`, not the
+    snake_case names of the minimal spec schema; both spellings must load."""
+    from datetime import UTC, datetime
+
+    from trader.sources.serenity.schema import Tweet
+
+    real = Tweet.model_validate(
+        {
+            "id": "2099659874892386678",
+            "text": "$SNDK looks strong",
+            "createdAt": "Tue Sep 15 00:41:38 +0000 2026",
+            "createdAtISO": "2026-09-15T00:41:38Z",
+            "sourceUrl": "https://x.com/aleabitoreddit/status/2099659874892386678",
+            "author": {"screenName": "aleabitoreddit"},
+        }
+    )
+    assert real.posted_at == datetime(2026, 9, 15, 0, 41, 38, tzinfo=UTC)
+    assert real.url == "https://x.com/aleabitoreddit/status/2099659874892386678"
+
+    twitter_only = Tweet.model_validate(
+        {"id": "1", "text": "x", "createdAt": "Tue Sep 15 00:41:38 +0000 2026"}
+    )
+    assert twitter_only.posted_at == datetime(2026, 9, 15, 0, 41, 38, tzinfo=UTC)
+
+    spec_shape = Tweet.model_validate(
+        {"id": "2", "text": "x", "created_at": "2026-09-15T00:00:00Z"}
+    )
+    assert spec_shape.posted_at == datetime(2026, 9, 15, tzinfo=UTC)

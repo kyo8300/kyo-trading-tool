@@ -12,11 +12,12 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _ID_RE = re.compile(r"^[0-9]+$")
 _TICKER_TOKEN_RE = re.compile(r"^[A-Z]{1,5}$")
 _TICKER_MENTION_RE = re.compile(r"\$([A-Z]{1,5})\b")
+_TWITTER_DATE_FORMAT = "%a %b %d %H:%M:%S %z %Y"
 
 
 class Tweet(BaseModel):
@@ -25,10 +26,27 @@ class Tweet(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     id: str
-    created_at: datetime | None = None
+    # The yan-labs archive names these `createdAtISO` / `createdAt` (Twitter's
+    # "Tue Sep 15 00:41:38 +0000 2026" form) and `sourceUrl`; the snake_case
+    # names are the documented minimal schema (spec). All are accepted.
+    created_at: datetime | None = Field(
+        default=None,
+        validation_alias=AliasChoices("created_at", "createdAtISO", "createdAt"),
+    )
     timestamp: datetime | None = None
     text: str
-    url: str | None = None
+    url: str | None = Field(default=None, validation_alias=AliasChoices("url", "sourceUrl"))
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _parse_twitter_date(cls, value: object) -> object:
+        """Accept Twitter's legacy `createdAt` format alongside ISO 8601."""
+        if isinstance(value, str):
+            try:
+                return datetime.strptime(value, _TWITTER_DATE_FORMAT)
+            except ValueError:
+                return value
+        return value
 
     @field_validator("id")
     @classmethod

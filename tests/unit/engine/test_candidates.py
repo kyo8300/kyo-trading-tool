@@ -229,3 +229,27 @@ def test_the_same_ticker_proposed_twice_in_one_batch_only_produces_one_passed_bu
     passed = [d for d in decisions if d.rule_check.value == "passed"]
     assert len(passed) == 1
     conn.close()
+
+
+def test_candidate_cap_keeps_the_most_mentioned_tickers() -> None:
+    """With more than 20 recently-mentioned tickers, the cap must keep the ones
+    with the most mentions in the last 14 days, not the alphabetically-first."""
+    from datetime import UTC, datetime
+
+    from trader.domain.models import Evidence, MentionStats
+    from trader.engine.candidates import _select_candidates
+
+    now = datetime(2026, 9, 15, tzinfo=UTC)
+    evidences = tuple(
+        Evidence(
+            ticker=f"T{i:02d}",
+            stats=MentionStats(f"T{i:02d}", now, now, i + 1, i + 1, 0),
+            excerpts=(),
+            mention_ids=(),
+        )
+        for i in range(30)
+    )
+    chosen = _select_candidates(evidences, held_tickers=(), excluded_tickers=())
+    assert len(chosen) == 20
+    assert chosen[0] == "T29"
+    assert "T00" not in chosen and "T09" not in chosen
