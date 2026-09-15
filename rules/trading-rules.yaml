@@ -1,5 +1,5 @@
-approved_by: ""          # kyo が記入（trader rules approve 時に必須）
-approved_at: ""
+approved_by: "kyo" # kyo が記入（trader rules approve 時に必須）
+approved_at: "2026-09-15"
 
 # 運用資金（USD）。paper でも live 予定額と同じ額にして、paper 成績と live 成績を同じ土俵で比較できるようにする。
 # 既定 $500（約 7.5 万円）: 実弾で全額失っても生活に影響しない額、かつ 1 銘柄 15% = $75 で Serenity 銘柄（多くが $5〜$60）を
@@ -41,8 +41,8 @@ loss_limits:
 
 entry:
   # 流動性の下限。薄い銘柄は cost_assumptions のスリッページ 0.5% が成り立たない。
-  min_price_usd: "2"                   # ペニー株除外
-  min_avg_daily_volume: 200000         # 直近 20 日平均の出来高（株）
+  min_price_usd: "2" # ペニー株除外
+  min_avg_daily_volume: 200000 # 直近 20 日平均の出来高（株）
   excluded_tickers: []
 
 # R-23 実弾期待値の係数（決定値。live ブローカー確定時に commission_* と fx_cost_pct_one_way を合わせる）
@@ -51,7 +51,7 @@ cost_assumptions:
   slippage_pct_per_side: "0.5"
   # 約定代金に対する手数料率。Alpaca: "0" / moomoo: "0.132"（上限 $22、commission_cap_usd で表現）/ ウィブル: 要確認。
   commission_pct: "0"
-  commission_cap_usd: ""               # 空 = 上限なし。moomoo なら "22"
+  commission_cap_usd: "" # 空 = 上限なし。moomoo なら "22"
   # 注文あたりの固定手数料。SEC/FINRA fee 等の実額は fills.fee に記録するのでここには含めない。
   commission_usd_per_order: "0"
   # 入出金時の USD/JPY コスト（片道、概算）。
