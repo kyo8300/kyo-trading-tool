@@ -41,10 +41,13 @@ class _FakeThinkingBlock:
 
 
 class _FakeMessage:
-    def __init__(self, text: str, *, thinking_first: bool = False) -> None:
+    def __init__(
+        self, text: str, *, thinking_first: bool = False, stop_reason: str = "end_turn"
+    ) -> None:
         blocks: list[Any] = [_FakeThinkingBlock()] if thinking_first else []
         blocks.append(_FakeContentBlock(text))
         self.content = blocks
+        self.stop_reason = stop_reason
 
 
 class _FlakyMessages:
@@ -158,6 +161,55 @@ def test_text_is_taken_from_the_first_text_block_after_thinking() -> None:
 
     assert isinstance(result, Ok)
     assert result.value.text == '{"proposals": []}'
+
+
+def test_request_uses_structured_output_with_the_proposal_schema() -> None:
+    """Free-form JSON prompting produced 'llm response is not valid JSON' on
+    every production cycle (2026-09-16). Ask the API to enforce the schema."""
+    messages = _FlakyMessages([_FakeMessage('{"proposals": []}')])
+    client = _client(messages)
+
+    client.complete(_prompt())
+
+    sent = messages.create_kwargs[0]
+    fmt = sent["output_config"]["format"]
+    assert fmt["type"] == "json_schema"
+    schema = fmt["schema"]
+    assert schema["additionalProperties"] is False
+    proposal = schema["properties"]["proposals"]["items"]
+    assert proposal["properties"]["action"]["enum"] == ["buy", "hold", "skip"]
+    assert "sell" not in proposal["properties"]["action"]["enum"]
+    assert proposal["additionalProperties"] is False
+    assert set(proposal["required"]) == {
+        "ticker",
+        "action",
+        "confidence",
+        "rationale",
+        "evidence_mention_ids",
+    }
+
+
+def test_max_tokens_leaves_room_for_twenty_proposals() -> None:
+    """2048 tokens truncated a 20-candidate batch mid-JSON."""
+    messages = _FlakyMessages([_FakeMessage('{"proposals": []}')])
+    client = _client(messages)
+
+    client.complete(_prompt())
+
+    assert messages.create_kwargs[0]["max_tokens"] >= 8000
+
+
+def test_truncated_response_is_an_error_not_invalid_json() -> None:
+    messages = _FlakyMessages(
+        [_FakeMessage('{"proposals": [{"ticker": "AA', stop_reason="max_tokens")]
+    )
+    client = _client(messages)
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Err)
+    assert "max_tokens" in result.error.message
+    assert result.error.retryable is False
 
 
 def test_timeout_is_retried() -> None:

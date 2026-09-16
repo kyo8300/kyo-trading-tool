@@ -30,10 +30,40 @@ from trader.domain.result import Err, Ok, Result
 from trader.domain.retry import RetryPolicy, backoff_delays
 
 _RETRY_POLICY = RetryPolicy(max_attempts=2, base_delay_s=Decimal("1"), max_delay_s=Decimal("8"))
-_MAX_TOKENS = 2048
+# 20 candidates x (rationale + evidence ids) did not fit in 2048 tokens; a
+# truncated batch is unparseable, so all 20 decisions became `skip`.
+_MAX_TOKENS = 16000
 # No `temperature` / `top_p` / `top_k`: current models (Sonnet 5, Opus 5,
 # Fable 5) reject sampling parameters with HTTP 400. Output determinism is
 # handled by the prompt + schema validation, not by sampling knobs.
+
+# Structured output (`output_config.format`): the API guarantees the text
+# block is JSON matching this schema, so "not valid JSON" / prose preambles
+# / markdown fences cannot happen. Mirrors `output_schema.LlmProposal` --
+# `action` deliberately has no "sell" (R-13) and no extra keys (R-7).
+_PROPOSAL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "proposals": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "ticker": {"type": "string"},
+                    "action": {"type": "string", "enum": ["buy", "hold", "skip"]},
+                    "confidence": {"type": "number"},
+                    "rationale": {"type": "string"},
+                    "evidence_mention_ids": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["ticker", "action", "confidence", "rationale", "evidence_mention_ids"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["proposals"],
+    "additionalProperties": False,
+}
+_OUTPUT_CONFIG: dict[str, Any] = {"format": {"type": "json_schema", "schema": _PROPOSAL_SCHEMA}}
 
 
 def _default_sleep(delay_s: Decimal) -> None:
@@ -157,6 +187,7 @@ class AnthropicClient:
                     max_tokens=_MAX_TOKENS,
                     system=prompt.system,
                     messages=[{"role": "user", "content": prompt.user}],
+                    output_config=_OUTPUT_CONFIG,
                 )
             except Exception as exc:  # boundary: convert to Err (N-6)
                 last_error = exc
@@ -166,6 +197,19 @@ class AnthropicClient:
                     continue
                 break
             else:
+                stop_reason = getattr(response, "stop_reason", None)
+                if stop_reason == "max_tokens":
+                    return Err(
+                        LlmError(
+                            f"llm response truncated (stop_reason=max_tokens, "
+                            f"max_tokens={_MAX_TOKENS})",
+                            retryable=False,
+                        )
+                    )
+                if stop_reason == "refusal":
+                    return Err(
+                        LlmError("llm refused the request (stop_reason=refusal)", retryable=False)
+                    )
                 text = self._extract_text(response)
                 if text is None:
                     return Err(LlmError("llm response had no text content", retryable=False))
