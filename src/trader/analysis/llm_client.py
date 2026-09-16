@@ -31,7 +31,9 @@ from trader.domain.retry import RetryPolicy, backoff_delays
 
 _RETRY_POLICY = RetryPolicy(max_attempts=2, base_delay_s=Decimal("1"), max_delay_s=Decimal("8"))
 _MAX_TOKENS = 2048
-_TEMPERATURE = 0.2
+# No `temperature` / `top_p` / `top_k`: current models (Sonnet 5, Opus 5,
+# Fable 5) reject sampling parameters with HTTP 400. Output determinism is
+# handled by the prompt + schema validation, not by sampling knobs.
 
 
 def _default_sleep(delay_s: Decimal) -> None:
@@ -53,6 +55,35 @@ def _is_retryable(exc: Exception) -> bool:
     return isinstance(exc, (APITimeoutError, APIConnectionError))
 
 
+def _api_error_message(exc: APIStatusError) -> str | None:
+    """The API's own `error.message` (e.g. "temperature: Extra inputs are not
+    permitted"), or `None`. Only that one field -- never the whole body."""
+    body = exc.body
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return None
+    message = error.get("message")
+    return message if isinstance(message, str) and message else None
+
+
+def _describe_error(exc: Exception | None) -> str:
+    """A human-readable failure summary for the ledger (N-6): exception type,
+    HTTP status, and the API's message. The API key is never part of any of
+    these. Without the status and message, a 400 is undebuggable from the
+    ledger alone (every candidate just reads "BadRequestError")."""
+    if exc is None:
+        return "llm call failed: unknown error"
+    summary = f"llm call failed: {type(exc).__name__}"
+    if isinstance(exc, APIStatusError):
+        summary += f" (HTTP {exc.status_code})"
+        api_message = _api_error_message(exc)
+        if api_message is not None:
+            summary += f": {api_message}"
+    return summary
+
+
 @dataclass(frozen=True, slots=True)
 class LlmRaw:
     """A successful raw LLM call result, ready for the ledger to record."""
@@ -67,7 +98,8 @@ class LlmRaw:
 class LlmError:
     """A human-readable LLM call error (N-6).
 
-    `message` never includes the API key or response body.
+    `message` never includes the API key or the raw response body -- at most
+    the API's own `error.message` field.
     """
 
     message: str
@@ -123,7 +155,6 @@ class AnthropicClient:
                 response = self._client.messages.create(
                     model=self.model,
                     max_tokens=_MAX_TOKENS,
-                    temperature=_TEMPERATURE,
                     system=prompt.system,
                     messages=[{"role": "user", "content": prompt.user}],
                 )
@@ -147,15 +178,20 @@ class AnthropicClient:
                     )
                 )
 
-        error_type = type(last_error).__name__ if last_error is not None else "unknown error"
-        return Err(LlmError(f"llm call failed: {error_type}", retryable=last_retryable))
+        return Err(LlmError(_describe_error(last_error), retryable=last_retryable))
 
     @staticmethod
     def _extract_text(response: Any) -> str | None:
+        """The first `text` content block. Adaptive thinking (on by default
+        on Sonnet 5 / Opus 5) puts a `thinking` block first, so `content[0]`
+        is not necessarily the answer."""
         content = getattr(response, "content", None)
         if not content:
             return None
-        text = getattr(content[0], "text", None)
-        if not isinstance(text, str):
-            return None
-        return text
+        for block in content:
+            if getattr(block, "type", None) != "text":
+                continue
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                return text
+        return None
