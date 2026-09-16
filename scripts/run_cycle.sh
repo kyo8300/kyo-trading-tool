@@ -19,7 +19,30 @@ source .env
 set +a
 
 mkdir -p var
-UV_BIN="${UV_BIN:-$(command -v uv || echo "$HOME/.local/bin/uv")}"
+
+# cron の PATH は /usr/bin:/bin だけなので、uv を既知の場所から探す。
+# crontab で UV_BIN=/path/to/uv を指定すればそれが優先される。
+find_uv() {
+  if [[ -n "${UV_BIN:-}" ]]; then
+    echo "$UV_BIN"
+    return
+  fi
+  local candidate
+  for candidate in \
+    "$(command -v uv 2>/dev/null || true)" \
+    "$HOME/.local/bin/uv" \
+    "$HOME/.cargo/bin/uv" \
+    /opt/homebrew/bin/uv \
+    /usr/local/bin/uv; do
+    if [[ -n "$candidate" && -x "$candidate" ]]; then
+      echo "$candidate"
+      return
+    fi
+  done
+  echo "run_cycle.sh: uv が見つかりません（crontab に UV_BIN=/path/to/uv を追加してください）" >&2
+  exit 1
+}
+UV_BIN="$(find_uv)"
 {
   echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) run-cycle start"
   "$UV_BIN" run trader run-cycle

@@ -8,6 +8,10 @@
 # 時間帯は市場時間（9:30〜16:00 ET）に寄せている。
 
 REPO=/path/to/kyo-trading-tool
+# 環境変数行は「それより下の行」にだけ効く。run_cycle.sh は uv を ~/.local/bin,
+# /opt/homebrew/bin, /usr/local/bin から探すので通常は不要だが、別の場所に入れている
+# 場合は `which uv` の結果をここに書く。
+# UV_BIN=/opt/homebrew/bin/uv
 
 # --- Linux 版（米東部時間で指定） ---
 CRON_TZ=America/New_York
