@@ -19,19 +19,32 @@ from trader.domain.result import Err, Ok
 _REQUEST = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
 
 
-def _status_error(status_code: int) -> APIStatusError:
-    response = httpx.Response(status_code=status_code, request=_REQUEST, json={"error": {}})
-    return APIStatusError(f"status {status_code}", response=response, body={"error": {}})
+def _status_error(status_code: int, message: str | None = None) -> APIStatusError:
+    body: dict[str, Any] = {"error": {}} if message is None else {"error": {"message": message}}
+    response = httpx.Response(status_code=status_code, request=_REQUEST, json=body)
+    return APIStatusError(message or f"status {status_code}", response=response, body=body)
 
 
 class _FakeContentBlock:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, block_type: str = "text") -> None:
+        self.type = block_type
         self.text = text
 
 
+class _FakeThinkingBlock:
+    """What adaptive thinking (on by default on Sonnet 5 / Opus 5) puts first
+    in `content`: a `thinking` block with no `text` attribute."""
+
+    def __init__(self) -> None:
+        self.type = "thinking"
+        self.thinking = ""
+
+
 class _FakeMessage:
-    def __init__(self, text: str) -> None:
-        self.content = [_FakeContentBlock(text)]
+    def __init__(self, text: str, *, thinking_first: bool = False) -> None:
+        blocks: list[Any] = [_FakeThinkingBlock()] if thinking_first else []
+        blocks.append(_FakeContentBlock(text))
+        self.content = blocks
 
 
 class _FlakyMessages:
@@ -40,9 +53,11 @@ class _FlakyMessages:
     def __init__(self, results: list[Any]) -> None:
         self._results = results
         self.calls = 0
+        self.create_kwargs: list[dict[str, Any]] = []
 
-    def create(self, **_kwargs: object) -> Any:
+    def create(self, **kwargs: Any) -> Any:
         self.calls += 1
+        self.create_kwargs.append(kwargs)
         result = self._results[min(self.calls - 1, len(self._results) - 1)]
         if isinstance(result, Exception):
             raise result
@@ -100,6 +115,49 @@ def test_bad_request_is_not_retried() -> None:
     assert isinstance(result, Err)
     assert result.error.retryable is False
     assert messages.calls == 1
+
+
+def test_bad_request_error_message_names_the_api_reason() -> None:
+    """A 400 with no visible reason is undebuggable from the ledger (the
+    2026-09-16 production incident: every cycle skipped every candidate with
+    only 'BadRequestError'). Surface the API's own message and status code."""
+    api_message = "temperature: Extra inputs are not permitted"
+    messages = _FlakyMessages([_status_error(400, api_message)])
+    client = _client(messages)
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Err)
+    assert "400" in result.error.message
+    assert api_message in result.error.message
+    assert "sk-test" not in result.error.message
+
+
+def test_request_does_not_send_sampling_parameters() -> None:
+    """Current models (Sonnet 5 / Opus 5 / Fable 5) reject `temperature`,
+    `top_p` and `top_k` with HTTP 400, so the request must not carry them."""
+    messages = _FlakyMessages([_FakeMessage('{"proposals": []}')])
+    client = _client(messages)
+
+    client.complete(_prompt())
+
+    assert messages.calls == 1
+    sent = messages.create_kwargs[0]
+    assert "temperature" not in sent
+    assert "top_p" not in sent
+    assert "top_k" not in sent
+    assert sent["model"] == "claude-test-model"
+    assert sent["system"] == "be a helpful analyst"
+
+
+def test_text_is_taken_from_the_first_text_block_after_thinking() -> None:
+    messages = _FlakyMessages([_FakeMessage('{"proposals": []}', thinking_first=True)])
+    client = _client(messages)
+
+    result = client.complete(_prompt())
+
+    assert isinstance(result, Ok)
+    assert result.value.text == '{"proposals": []}'
 
 
 def test_timeout_is_retried() -> None:
