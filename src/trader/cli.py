@@ -282,6 +282,8 @@ def run_cycle() -> None:
     )
     if outcome.error_summary:
         typer.echo(f"  detail: {outcome.error_summary}")
+    if outcome.candidates_skipped_reason:
+        typer.echo(f"  candidates: skipped ({outcome.candidates_skipped_reason})")
     if outcome.outcome == "error":
         raise typer.Exit(code=1)
 

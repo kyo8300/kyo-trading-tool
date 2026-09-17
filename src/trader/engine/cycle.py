@@ -6,8 +6,10 @@ holdings only (decisions are kept, nothing is submitted) -> fetch the market
 clock (a failure here means no new buys and no equity snapshot this cycle)
 -> evaluate holdings -> compute equity and upsert today's snapshot -> check
 daily/weekly/drawdown loss limits (a breach fires the kill switch and ends
-the cycle) -> evaluate candidates -> if the market is closed, stop (decisions
-are kept, nothing is submitted) -> for every passed buy/sell decision,
+the cycle) -> if every position slot is taken, skip candidates and the LLM
+call (only holdings sells can execute) -> evaluate candidates -> if the
+market is closed, stop (decisions are kept, nothing is submitted) -> for
+every passed buy/sell decision,
 resolve approval, execute, and poll for fills -> close the `cycles` row.
 """
 
@@ -75,6 +77,9 @@ class CycleOutcome:
     orders: int
     fills: int
     error_summary: str | None
+    # Set when candidate evaluation (and the LLM call) was skipped for this
+    # cycle, e.g. because every position slot is already taken.
+    candidates_skipped_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +150,7 @@ def _finish(
     orders: int,
     fills: int,
     clock: Clock,
+    candidates_skipped_reason: str | None = None,
 ) -> Result[CycleOutcome, CycleError]:
     finish_result = finish_cycle(conn, cycle_id, clock.now(), outcome, error_summary)
     if isinstance(finish_result, Err):
@@ -173,6 +179,7 @@ def _finish(
             orders=orders,
             fills=fills,
             error_summary=error_summary,
+            candidates_skipped_reason=candidates_skipped_reason,
         )
     )
 
@@ -368,6 +375,31 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
         return risk_outcome
 
     held_tickers = {p.ticker for p in positions}
+    max_positions = deps.rules.position.max_concurrent_positions
+    if len(positions) >= max_positions:
+        # Every buy would be rejected by `rules.entry_checks` anyway
+        # (`max_concurrent_positions`), so do not price 20 candidates and pay
+        # for an LLM call whose only possible outcome is "rejected". Sells
+        # were already evaluated above and are submitted below as usual.
+        skipped = f"holdings {len(positions)} >= max_concurrent_positions {max_positions}"
+        orders_count = 0
+        fills_count = 0
+        if market_clock.is_open:
+            orders_count, fills_count = _execute_passed_decisions(
+                deps, conn, holdings_outcome.decisions, holdings_outcome.exit_reasons, market_clock
+            )
+        return _finish(
+            conn,
+            cycle_id,
+            "ok",
+            None,
+            decisions_count,
+            orders_count,
+            fills_count,
+            deps.clock,
+            candidates_skipped_reason=skipped,
+        )
+
     mentions = list_mentions(conn, _SERENITY_SOURCE_ID)
     candidates_result = evaluate_candidates(
         conn,
