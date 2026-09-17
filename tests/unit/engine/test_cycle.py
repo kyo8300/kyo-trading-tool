@@ -1135,9 +1135,24 @@ def test_drawdown_breach_halts_engine_and_blocks_next_cycle(tmp_path: Path) -> N
     conn.close()
 
 
-def test_max_concurrent_positions_rejects_new_buy(tmp_path: Path) -> None:
-    """AC-11/T-13: with `max_concurrent_positions` (5) already held, a new
-    LLM buy must be rejected by the rule engine and never become an order."""
+@dataclass
+class _CountingLlm(_FakeLlm):
+    """`_FakeLlm` that counts `complete` calls."""
+
+    calls: int = 0
+
+    def complete(self, prompt: object) -> Result[object, object]:
+        self.calls += 1
+        return super().complete(prompt)
+
+
+def test_full_book_skips_candidate_evaluation_and_the_llm(tmp_path: Path) -> None:
+    """With `max_concurrent_positions` (5) already held, every buy would be
+    rejected by the rule engine anyway (AC-11, covered in
+    tests/unit/rules/test_entry_checks.py), so the cycle must not price the
+    candidates or pay for an LLM call: no candidate decisions are recorded,
+    the LLM is never called, and the outcome says why. Holdings are still
+    evaluated (sells are rule-driven and never wait for a free slot)."""
     conn, rule_set, limits, sha256 = _db(tmp_path)
     _ingest_mentions(conn, tmp_path)
 
@@ -1162,7 +1177,7 @@ def test_max_concurrent_positions_rejects_new_buy(tmp_path: Path) -> None:
     broker = FakeBroker().with_account(
         BrokerAccount(cash=Money(Decimal("500.00")), equity=Money(Decimal("500.00")))
     )
-    llm = _FakeLlm(ticker="AAPL")
+    llm = _CountingLlm(ticker="AAPL")
 
     deps = CycleDeps(
         mode=TradingMode.paper,
@@ -1183,14 +1198,64 @@ def test_max_concurrent_positions_rejects_new_buy(tmp_path: Path) -> None:
 
     assert isinstance(result, Ok)
     outcome = result.value
+    assert outcome.outcome == "ok"
     assert outcome.orders == 0
     assert broker.submit_call_count == 0
+    assert llm.calls == 0
+    assert outcome.candidates_skipped_reason is not None
+    assert "max_concurrent_positions" in outcome.candidates_skipped_reason
 
     decisions = list_decisions(conn, outcome.cycle_id)
-    aapl_decisions = [d for d in decisions if d.ticker == "AAPL"]
-    assert len(aapl_decisions) == 1
-    assert aapl_decisions[0].rule_check.value == "rejected"
-    assert "max_concurrent_positions" in aapl_decisions[0].rule_check_reason
+    assert [d for d in decisions if d.ticker == "AAPL"] == []
+    conn.close()
+
+
+def test_open_slot_still_evaluates_candidates(tmp_path: Path) -> None:
+    """The full-book short-circuit must not fire with one slot free."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    for i in range(4):
+        position = Position(
+            ticker=f"HLD{i}",
+            qty=Quantity(1),
+            avg_cost=Price(Decimal("10.00")),
+            opened_at=_NOW - timedelta(days=1),
+            high_watermark=Price(Decimal("10.00")),
+            partial_tp_done=False,
+        )
+        assert isinstance(upsert_position(conn, position), Ok)
+
+    held_prices = {f"HLD{i}": Price(Decimal("10.00")) for i in range(4)}
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10")), **held_prices},
+        bars={"AAPL": _bars("AAPL")},
+        clock=_OPEN_CLOCK,
+    )
+    broker = _ImmediateFillBroker(fill_price=Price(Decimal("10")))
+    llm = _CountingLlm(ticker="AAPL")
+
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    assert llm.calls == 1
+    assert result.value.candidates_skipped_reason is None
+    assert result.value.orders == 1
     conn.close()
 
 
