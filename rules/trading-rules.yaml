@@ -1,12 +1,12 @@
 approved_by: "kyo" # kyo が記入（trader rules approve 時に必須）
-approved_at: "2026-09-15"
+approved_at: "2026-09-17"
 
 # 運用資金（USD）。paper でも live 予定額と同じ額にして、paper 成績と live 成績を同じ土俵で比較できるようにする。
 # 既定 $500（約 7.5 万円）: 実弾で全額失っても生活に影響しない額、かつ 1 銘柄 15% = $75 で Serenity 銘柄（多くが $5〜$60）を
 # 整数株で買える下限付近。
 # kyo が承認時に変更できる。$300〜$1,000 の範囲なら以下の比率は変えなくてよい。$300 未満だと 1 銘柄 $45 未満になり
 # 買える銘柄が減るので、position.max_concurrent_positions を 3 に減らすことを推奨（1 銘柄 25% になる）。
-capital_usd: "500"
+capital_usd: "2500"
 
 position:
   # capital の 15%。5 銘柄で 75% 稼働、残り 25% は現金バッファ（スリッページ・端数・翌日の追加買いの余地）。
