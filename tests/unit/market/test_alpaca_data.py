@@ -509,3 +509,52 @@ def _bar() -> Bar:
         close=Price(Decimal("10.5")),
         volume=100_000,
     )
+
+
+# --- daily_bars request window (2026-09-17 production finding) ------------
+
+
+class _CapturingBars:
+    def __init__(self, raw: dict[str, Any]) -> None:
+        self.raw = raw
+        self.requests: list[Any] = []
+
+    def __call__(self, request: Any) -> Any:
+        self.requests.append(request)
+        return self.raw
+
+
+def test_daily_bars_requests_an_explicit_start_well_before_today() -> None:
+    """Without `start`, Alpaca defaults to the beginning of the current day:
+    at the 09:30 ET open no daily bar exists yet (every candidate dropped,
+    `decisions=0`), and later in the day only today's partial bar is
+    returned, so `average_volume` was a single intraday partial. Ask for a
+    window that covers at least 20 trading days."""
+    now = datetime(2026, 9, 17, 13, 30, tzinfo=UTC)
+    bars = _CapturingBars({"AAPL": [_raw_bar()]})
+    market = AlpacaMarketData(
+        _data_client=_FakeDataClient(bars_call=bars),
+        _trading_client=_FakeTradingClient(),
+        _sleep=lambda _delay: None,
+        _retry_policy=_RETRY_POLICY,
+        _now=lambda: now,
+    )
+
+    market.daily_bars("AAPL", days=20)
+
+    request = bars.requests[0]
+    assert request.start is not None
+    assert (now - request.start.replace(tzinfo=UTC)).days >= 35
+    assert request.limit is None or request.limit >= 20
+
+
+def test_daily_bars_keeps_only_the_most_recent_days() -> None:
+    raw = {"AAPL": [_raw_bar(t=f"2026-08-{d:02d}T04:00:00Z") for d in range(1, 31)]}
+    market = _market(data_client=_FakeDataClient(bars_call=lambda request: raw))
+
+    result = market.daily_bars("AAPL", days=20)
+
+    assert isinstance(result, Ok)
+    assert len(result.value) == 20
+    assert result.value[-1].date.isoformat() == "2026-08-30"
+    assert result.value[0].date.isoformat() == "2026-08-11"

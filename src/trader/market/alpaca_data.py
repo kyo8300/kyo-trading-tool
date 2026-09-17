@@ -18,7 +18,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -46,6 +46,16 @@ _GET_RETRY_POLICY = RetryPolicy(
     max_attempts=3, base_delay_s=Decimal("0.5"), max_delay_s=Decimal("4")
 )
 _DEFAULT_TIMEOUT_S = 10
+# Calendar days to look back for daily bars. Alpaca's `start` defaults to the
+# beginning of the *current* day, so a request without it returns nothing at
+# the 09:30 ET open (every candidate dropped, `decisions=0`) and only today's
+# partial bar later on (2026-09-17 production finding). 45 calendar days
+# covers 20 trading days even across holidays; the newest `days` are kept.
+_BARS_LOOKBACK_DAYS = 45
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
 
 def _default_sleep(delay_s: Decimal) -> None:
@@ -179,6 +189,7 @@ class AlpacaMarketData:
     _trading_client: Any
     _sleep: Callable[[Decimal], None]
     _retry_policy: RetryPolicy
+    _now: Callable[[], datetime] = _utc_now
 
     @classmethod
     def create(
@@ -191,6 +202,7 @@ class AlpacaMarketData:
         trading_client_factory: Callable[..., Any] = TradingClient,
         sleep: Callable[[Decimal], None] = _default_sleep,
         timeout_s: int = _DEFAULT_TIMEOUT_S,
+        now: Callable[[], datetime] = _utc_now,
     ) -> AlpacaMarketData:
         """Build an `AlpacaMarketData` from read-only Alpaca credentials.
 
@@ -216,13 +228,14 @@ class AlpacaMarketData:
             _trading_client=trading_client,
             _sleep=sleep,
             _retry_policy=_GET_RETRY_POLICY,
+            _now=now,
         )
 
     def daily_bars(self, ticker: str, days: int = 20) -> Result[tuple[Bar, ...], MarketError]:
         request = StockBarsRequest(
             symbol_or_symbols=ticker,
             timeframe=TimeFrame(1, TimeFrameUnit.Day),
-            limit=days,
+            start=self._now() - timedelta(days=_BARS_LOOKBACK_DAYS),
         )
         raw_result = self._call_with_retry(
             lambda: self._data_client.get_stock_bars(request), op=f"daily_bars({ticker})"
@@ -240,7 +253,8 @@ class AlpacaMarketData:
             if isinstance(bar_result, Err):
                 return bar_result
             bars.append(bar_result.value)
-        return Ok(tuple(bars))
+        bars.sort(key=lambda bar: bar.date)
+        return Ok(tuple(bars[-days:]) if days > 0 else ())
 
     def latest_price(self, ticker: str) -> Result[Price, MarketError]:
         request = StockLatestTradeRequest(symbol_or_symbols=ticker)
