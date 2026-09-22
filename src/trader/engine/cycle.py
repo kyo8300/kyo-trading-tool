@@ -4,13 +4,16 @@ candidates, approval, execution, and fills together for one `run-cycle`.
 Order: acquire the lock file -> open a `cycles` row -> if halted, evaluate
 holdings only (decisions are kept, nothing is submitted) -> fetch the market
 clock (a failure here means no new buys and no equity snapshot this cycle)
--> evaluate holdings -> compute equity and upsert today's snapshot -> check
-daily/weekly/drawdown loss limits (a breach fires the kill switch and ends
-the cycle) -> if every position slot is taken, skip candidates and the LLM
-call (only holdings sells can execute) -> evaluate candidates -> if the
-market is closed, stop (decisions are kept, nothing is submitted) -> for
-every passed buy/sell decision,
-resolve approval, execute, and poll for fills -> close the `cycles` row.
+-> evaluate holdings -> compute equity (`capital_usd` + ledger fills, never
+the broker balance) and upsert today's snapshot -> check daily/weekly/
+drawdown loss limits (a breach fires the kill switch and ends the cycle) ->
+reconcile the ledger's positions against the broker's (a mismatch is
+persisted to `engine_state` and blocks new buys; rule-driven sells still
+run) -> if every position slot is taken, skip candidates and the LLM call
+(only holdings sells can execute) -> evaluate candidates -> if the market is
+closed, stop (decisions are kept, nothing is submitted) -> for every passed
+buy/sell decision, resolve approval, execute, and poll for fills -> close
+the `cycles` row.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ from trader.analysis.analyst import LlmClient
 from trader.broker.broker import Broker
 from trader.config.mode import TradingMode
 from trader.domain.clock import Clock
-from trader.domain.models import Action, Decision, ExitReason, RuleCheck, Trade
+from trader.domain.models import Action, Decision, ExitReason, Position, RuleCheck, Trade
 from trader.domain.money import Money
 from trader.domain.result import Err, Ok, Result
 from trader.engine.approval import resolve_approval
@@ -40,9 +43,12 @@ from trader.engine.holdings import HoldingsOutcome, evaluate_holdings
 from trader.engine.kill_switch import is_halted
 from trader.engine.kill_switch import trigger as trigger_kill_switch
 from trader.engine.order_executor import execute
+from trader.engine.reconcile import POSITION_MISMATCH_KEY, reconcile_positions
 from trader.ledger.portfolio_repository import (
+    delete_engine_state,
     finish_cycle,
     insert_cycle,
+    ledger_cash,
     list_equity_snapshots,
     list_positions,
     list_trades,
@@ -206,25 +212,30 @@ def _evaluate_risk(
     holdings_outcome: HoldingsOutcome,
     decisions_count: int,
 ) -> Result[CycleOutcome, CycleError] | None:
-    """Fetch account equity, upsert today's `equity_snapshots`, and check
+    """Compute equity, upsert today's `equity_snapshots`, and check
     daily/weekly/drawdown loss limits (a breach fires the kill switch).
 
-    Returns a finished `Result` if the cycle must stop here (account/
+    `cash` is `capital_usd` adjusted by the ledger's own fills
+    (`ledger_cash`), not the broker's account balance: an Alpaca paper
+    account starts at $100,000 regardless of `capital_usd`, which would make
+    the 15% drawdown kill switch unreachable for a $2,500 strategy.
+
+    Returns a finished `Result` if the cycle must stop here (ledger/
     snapshot error, or a loss-limit breach), or `None` to keep going.
     """
-    account_result = deps.broker.account()
-    if isinstance(account_result, Err):
+    cash_result = ledger_cash(conn, deps.capital)
+    if isinstance(cash_result, Err):
         return _finish(
             conn,
             cycle_id,
-            "market_unavailable",
-            account_result.error.message,
+            "error",
+            cash_result.error.message,
             decisions_count,
             0,
             0,
             deps.clock,
         )
-    cash = account_result.value.cash
+    cash = cash_result.value
     equity = cash + holdings_outcome.positions_value
 
     now = deps.clock.now()
@@ -283,6 +294,32 @@ def _evaluate_risk(
         return _finish(conn, cycle_id, "halted", breach.reason, decisions_count, 0, 0, deps.clock)
 
     return None
+
+
+def _reconcile_with_broker(
+    deps: CycleDeps, conn: sqlite3.Connection, positions: tuple[Position, ...]
+) -> Result[str | None, CycleError]:
+    """Compare the ledger's positions with the broker's and persist the result.
+
+    Returns `Ok(reason)` when new buys must be skipped this cycle (the books
+    disagree, or the broker could not be asked), `Ok(None)` when they agree.
+    A mismatch is written to `engine_state[POSITION_MISMATCH_KEY]` so
+    `trader status` can show it; agreement clears the key. Only an
+    `engine_state` write failure is an `Err` (R-16: an unrecordable state is
+    not acted on).
+    """
+    broker_result = deps.broker.positions()
+    if isinstance(broker_result, Err):
+        return Ok(f"broker positions unavailable: {broker_result.error.message}")
+    mismatches = reconcile_positions(positions, broker_result.value)
+    if not mismatches:
+        delete_engine_state(conn, POSITION_MISMATCH_KEY)
+        return Ok(None)
+    detail = "; ".join(mismatches)
+    state_result = set_engine_state(conn, POSITION_MISMATCH_KEY, detail)
+    if isinstance(state_result, Err):
+        return Err(CycleError(state_result.error.message))
+    return Ok(f"position mismatch between ledger and broker: {detail}")
 
 
 def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
@@ -376,12 +413,29 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
 
     held_tickers = {p.ticker for p in positions}
     max_positions = deps.rules.position.max_concurrent_positions
-    if len(positions) >= max_positions:
+    reconcile_result = _reconcile_with_broker(deps, conn, positions)
+    if isinstance(reconcile_result, Err):
+        return _finish(
+            conn,
+            cycle_id,
+            "error",
+            reconcile_result.error.message,
+            decisions_count,
+            0,
+            0,
+            deps.clock,
+        )
+    skipped = reconcile_result.value
+    if skipped is None and len(positions) >= max_positions:
         # Every buy would be rejected by `rules.entry_checks` anyway
         # (`max_concurrent_positions`), so do not price 20 candidates and pay
         # for an LLM call whose only possible outcome is "rejected". Sells
         # were already evaluated above and are submitted below as usual.
         skipped = f"holdings {len(positions)} >= max_concurrent_positions {max_positions}"
+    if skipped is not None:
+        # New buys are off the table this cycle (the ledger and the broker
+        # disagree, the broker could not be asked, or the book is full), but
+        # rule-driven sells never wait (R-13).
         orders_count = 0
         fills_count = 0
         if market_clock.is_open:

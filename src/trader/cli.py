@@ -595,8 +595,9 @@ def status(
     """Show halted state, open positions, and the most recent cycle."""
     from trader.domain.result import Err
     from trader.engine.kill_switch import halt_info
+    from trader.engine.reconcile import POSITION_MISMATCH_KEY
     from trader.ledger.db import open_db
-    from trader.ledger.portfolio_repository import list_positions
+    from trader.ledger.portfolio_repository import get_engine_state, list_positions
 
     db_path = Path(db or os.environ.get("TRADER_DB_PATH", _DEFAULT_DB_PATH))
     if not db_path.exists():
@@ -615,6 +616,15 @@ def status(
             typer.echo("engine: running")
         else:
             typer.echo(f"engine: HALTED ({info.reason}) at {info.halted_at.isoformat()}")
+
+        mismatch = get_engine_state(conn, POSITION_MISMATCH_KEY)
+        if mismatch is not None:
+            typer.echo(
+                "WARNING: position mismatch (ledger と Alpaca の保有が一致しません。"
+                "一致するまで新規買いを停止しています)"
+            )
+            for line in mismatch.split("; "):
+                typer.echo(f"  {line}")
 
         positions = list_positions(conn)
         if positions:

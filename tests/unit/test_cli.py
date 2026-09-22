@@ -408,3 +408,20 @@ def test_resume_when_not_halted_reports_not_halted_without_erroring(tmp_path: Pa
 
     assert result.exit_code == 0, result.output
     assert "not halted" in result.output
+
+
+def test_status_warns_when_ledger_and_broker_positions_disagree(tmp_path: Path) -> None:
+    db_path = tmp_path / "trader.sqlite3"
+    conn = open_db(db_path).value
+    with transaction(conn):
+        portfolio_repo.set_engine_state(
+            conn, "position_mismatch", "HLD0: ledger 1 shares, broker 0 shares"
+        )
+    conn.close()
+
+    result = runner.invoke(app, ["status", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "WARNING: position mismatch" in result.output
+    assert "HLD0: ledger 1 shares, broker 0 shares" in result.output
+    assert "新規買いを停止" in result.output

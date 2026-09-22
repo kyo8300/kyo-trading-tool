@@ -153,6 +153,7 @@ class _ImmediateFillBroker:
 
     fill_price: Price
     cash: Money = field(default_factory=lambda: Money(Decimal("500.00")))
+    held: tuple[BrokerPosition, ...] = ()
     submitted: list[OrderRequest] = field(default_factory=list)
     _orders: dict[str, OrderRequest] = field(default_factory=dict)
 
@@ -187,7 +188,7 @@ class _ImmediateFillBroker:
         return Ok(0)
 
     def positions(self) -> Result[tuple[BrokerPosition, ...], BrokerError]:
-        return Ok(())
+        return Ok(self.held)
 
     def account(self) -> Result[BrokerAccount, BrokerError]:
         return Ok(BrokerAccount(cash=self.cash, equity=self.cash))
@@ -270,7 +271,10 @@ def test_normal_cycle_executes_both_a_holdings_sell_and_a_candidate_buy(tmp_path
         bars={"AAPL": _bars("AAPL")},
         clock=_OPEN_CLOCK,
     )
-    broker = _ImmediateFillBroker(fill_price=Price(Decimal("10")))
+    broker = _ImmediateFillBroker(
+        fill_price=Price(Decimal("10")),
+        held=(BrokerPosition(ticker="ZZZZ", qty=Quantity(7), avg_cost=Price(Decimal("10.00"))),),
+    )
     llm = _FakeLlm(ticker="AAPL")
 
     deps = CycleDeps(
@@ -1174,8 +1178,11 @@ def test_full_book_skips_candidate_evaluation_and_the_llm(tmp_path: Path) -> Non
         bars={"AAPL": _bars("AAPL")},
         clock=_OPEN_CLOCK,
     )
-    broker = FakeBroker().with_account(
-        BrokerAccount(cash=Money(Decimal("500.00")), equity=Money(Decimal("500.00")))
+    broker = FakeBroker().with_positions(
+        tuple(
+            BrokerPosition(ticker=f"HLD{i}", qty=Quantity(1), avg_cost=Price(Decimal("10.00")))
+            for i in range(5)
+        )
     )
     llm = _CountingLlm(ticker="AAPL")
 
@@ -1232,7 +1239,13 @@ def test_open_slot_still_evaluates_candidates(tmp_path: Path) -> None:
         bars={"AAPL": _bars("AAPL")},
         clock=_OPEN_CLOCK,
     )
-    broker = _ImmediateFillBroker(fill_price=Price(Decimal("10")))
+    broker = _ImmediateFillBroker(
+        fill_price=Price(Decimal("10")),
+        held=tuple(
+            BrokerPosition(ticker=f"HLD{i}", qty=Quantity(1), avg_cost=Price(Decimal("10.00")))
+            for i in range(4)
+        ),
+    )
     llm = _CountingLlm(ticker="AAPL")
 
     deps = CycleDeps(
@@ -1461,3 +1474,166 @@ def test_run_cycle_cli_refuses_to_run_under_trader_env_test() -> None:
 
     assert result.exit_code == 1
     assert "TRADER_ENV=test" in result.output
+
+
+def test_equity_snapshot_is_derived_from_capital_not_broker_balance(tmp_path: Path) -> None:
+    """Prove-It for the $100,000 Alpaca paper balance bug: with capital $500
+    and a broker reporting $100,000 cash, the equity snapshot must still read
+    capital-based cash. After a 7-share buy @ $10 (cost $70) the ledger cash
+    is $430, positions_value $70, equity $500 -- the broker balance never
+    enters the calculation."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10"))}, bars={"AAPL": _bars("AAPL")}, clock=_OPEN_CLOCK
+    )
+    broker = _ImmediateFillBroker(fill_price=Price(Decimal("10")), cash=Money(Decimal("100000.00")))
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=broker,
+        market=market,
+        llm=_FakeLlm(ticker="AAPL"),
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+    assert isinstance(result, Ok)
+    assert result.value.fills == 1
+
+    # The buy fills after this cycle's snapshot; the next cycle (broker now
+    # holding AAPL, price unchanged) values the book.
+    broker2 = _ImmediateFillBroker(
+        fill_price=Price(Decimal("10")),
+        cash=Money(Decimal("100000.00")),
+        held=(BrokerPosition(ticker="AAPL", qty=Quantity(7), avg_cost=Price(Decimal("10"))),),
+    )
+    result2 = run_cycle(replace(deps, broker=broker2, clock=FixedClock(_NOW + timedelta(days=1))))
+    assert isinstance(result2, Ok)
+
+    snapshots = list_equity_snapshots(conn)
+    assert len(snapshots) == 2
+    latest = snapshots[-1]
+    assert latest.cash == Money(Decimal("430.00"))
+    assert latest.positions_value == Money(Decimal("70.00"))
+    assert latest.equity == Money(Decimal("500.00"))
+    assert latest.peak_equity == Money(Decimal("500.00"))
+    assert latest.drawdown_pct == Decimal("0")
+    conn.close()
+
+
+def test_position_mismatch_blocks_new_buys_and_is_cleared_when_books_agree(
+    tmp_path: Path,
+) -> None:
+    """The ledger holds HLD0 (1 share) but the broker reports nothing: the
+    cycle must skip candidate evaluation (no LLM call, no buy), record the
+    mismatch in `engine_state`, and still finish `ok`. Once the broker agrees
+    with the ledger, the flag is cleared and buys resume."""
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    position = Position(
+        ticker="HLD0",
+        qty=Quantity(1),
+        avg_cost=Price(Decimal("10.00")),
+        opened_at=_NOW - timedelta(days=1),
+        high_watermark=Price(Decimal("10.00")),
+        partial_tp_done=False,
+    )
+    assert isinstance(upsert_position(conn, position), Ok)
+
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10")), "HLD0": Price(Decimal("10.00"))},
+        bars={"AAPL": _bars("AAPL")},
+        clock=_OPEN_CLOCK,
+    )
+    llm = _CountingLlm(ticker="AAPL")
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=_ImmediateFillBroker(fill_price=Price(Decimal("10"))),
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    assert result.value.outcome == "ok"
+    assert result.value.orders == 0
+    assert llm.calls == 0
+    assert result.value.candidates_skipped_reason is not None
+    assert "position mismatch" in result.value.candidates_skipped_reason
+    assert "HLD0: ledger 1 shares, broker 0 shares" in result.value.candidates_skipped_reason
+    flagged = get_engine_state(conn, "position_mismatch")
+    assert flagged is not None
+    assert "HLD0" in flagged
+
+    matching_broker = _ImmediateFillBroker(
+        fill_price=Price(Decimal("10")),
+        held=(BrokerPosition(ticker="HLD0", qty=Quantity(1), avg_cost=Price(Decimal("10.00"))),),
+    )
+    result2 = run_cycle(replace(deps, broker=matching_broker))
+
+    assert isinstance(result2, Ok)
+    assert result2.value.candidates_skipped_reason is None
+    assert llm.calls == 1
+    assert result2.value.orders == 1
+    assert get_engine_state(conn, "position_mismatch") is None
+    conn.close()
+
+
+def test_broker_positions_error_blocks_new_buys_without_flagging_mismatch(
+    tmp_path: Path,
+) -> None:
+    conn, rule_set, limits, sha256 = _db(tmp_path)
+    _ingest_mentions(conn, tmp_path)
+
+    @dataclass
+    class _PositionsFailBroker(_ImmediateFillBroker):
+        def positions(self) -> Result[tuple[BrokerPosition, ...], BrokerError]:
+            return Err(BrokerError("simulated positions failure"))
+
+    market = FakeMarketData(
+        prices={"AAPL": Price(Decimal("10"))}, bars={"AAPL": _bars("AAPL")}, clock=_OPEN_CLOCK
+    )
+    llm = _CountingLlm(ticker="AAPL")
+    deps = CycleDeps(
+        mode=TradingMode.paper,
+        rules=rule_set,
+        limits=limits,
+        rule_set_sha256=sha256,
+        conn=conn,
+        broker=_PositionsFailBroker(fill_price=Price(Decimal("10"))),
+        market=market,
+        llm=llm,
+        clock=FixedClock(_NOW),
+        capital=Money(rule_set.capital_usd),
+        sleep=lambda _s: None,
+        lock_path=None,
+    )
+
+    result = run_cycle(deps)
+
+    assert isinstance(result, Ok)
+    assert result.value.outcome == "ok"
+    assert result.value.orders == 0
+    assert llm.calls == 0
+    assert result.value.candidates_skipped_reason is not None
+    assert "broker positions unavailable" in result.value.candidates_skipped_reason
+    assert get_engine_state(conn, "position_mismatch") is None
+    conn.close()
