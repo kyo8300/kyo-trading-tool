@@ -13,7 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import cast
 
-from trader.domain.models import EquitySnapshot, ExitReason, Position, Trade
+from trader.domain.models import EquitySnapshot, ExitReason, Position, Side, Trade
 from trader.domain.money import Money, Price, Quantity, from_canonical, to_canonical
 from trader.domain.result import Err, Ok, Result
 from trader.ledger.db import LedgerError
@@ -223,6 +223,42 @@ def list_equity_snapshots(conn: sqlite3.Connection) -> tuple[EquitySnapshot, ...
     """Return every equity snapshot, oldest first (T-14 report: max drawdown)."""
     rows = conn.execute("SELECT * FROM equity_snapshots ORDER BY snapshot_date ASC").fetchall()
     return tuple(_row_to_equity_snapshot(row) for row in rows)
+
+
+# --- ledger cash -----------------------------------------------------------
+
+
+def ledger_cash(conn: sqlite3.Connection, capital: Money) -> Result[Money, LedgerError]:
+    """Cash implied by `capital` and the ledger's own fills.
+
+    `capital - Σ buy fills (qty * price) + Σ sell fills (qty * price) - Σ fees`.
+    This is the strategy's cash, deliberately independent of the broker's
+    account balance (an Alpaca paper account starts at $100,000, a live
+    account holds whatever was deposited) so that `equity = cash +
+    positions_value` and every drawdown check are measured against the
+    `capital_usd` kyo approved (spec 設計方針: 作戦は資金額に依存しない).
+    """
+    try:
+        rows = conn.execute(
+            """
+            SELECT o.side AS side, f.qty AS qty, f.price AS price, f.fee AS fee
+            FROM fills AS f
+            JOIN orders AS o ON o.id = f.order_id
+            """
+        ).fetchall()
+    except sqlite3.Error as exc:
+        return Err(LedgerError(f"could not read fills for ledger cash: {exc}"))
+    cash = capital
+    for row in rows:
+        notional = Money(_decimal_or_raise(row["price"]) * _decimal_or_raise(row["qty"]))
+        fee = Money(_decimal_or_raise(row["fee"]))
+        if row["side"] == Side.buy.value:
+            cash = cash - notional - fee
+        elif row["side"] == Side.sell.value:
+            cash = cash + notional - fee
+        else:
+            return Err(LedgerError(f"unknown order side in fills: {row['side']!r}"))
+    return Ok(cash)
 
 
 # --- engine state ----------------------------------------------------------

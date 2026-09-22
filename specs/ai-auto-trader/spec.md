@@ -300,6 +300,7 @@ $100 → $105 → $84 のように最高値をほとんど更新しないまま�
 `positions.high_watermark` を毎サイクル更新し（下げない）、`exit_checks` が `high_watermark × (1 − trailing_stop_pct/100)` と現在値を比較する。
 
 **ドローダウン判定の計算**: 毎サイクル、`equity = cash + Σ(保有数量 × 現在値)` を `equity_snapshots` に upsert し、
+`cash` は **ブローカーの口座残高ではなく** `capital_usd − Σ買い約定額 + Σ売り約定額 − Σ手数料`（ledger の fills から導出）。Alpaca paper 口座の残高は $100,000 固定で `capital_usd` と無関係なため、口座残高を使うとドローダウン上限が実質無効になる。ブローカーの保有は毎サイクル ledger の `positions` と突合し、不一致なら `engine_state.position_mismatch` に記録して新規買いを止める（ルール売りは続行）。
 `peak_equity = max(前日までの peak_equity, equity)`、`drawdown_pct = (peak_equity − equity) / peak_equity × 100`。
 `drawdown_pct >= max_drawdown_pct` でキルスイッチ（R-19）。`resume` は `halted` を解除するだけで `peak_equity` はリセットしない
 （リセットすると「負け続けても毎回 15% ずつ許す」ことになる。kyo が意図的にリセットしたい場合はルールファイルの `capital_usd` を変えて `rules approve` する。

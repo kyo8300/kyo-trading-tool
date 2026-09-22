@@ -50,7 +50,7 @@ def test_apply_migrations_is_idempotent(tmp_path: Path) -> None:
     assert third.is_ok()
     versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations")]
     assert len(versions) == len(set(versions))
-    assert len(versions) == 1
+    assert len(versions) == 2
     conn.close()
 
 
