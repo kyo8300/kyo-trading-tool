@@ -408,3 +408,78 @@ def test_resume_when_not_halted_reports_not_halted_without_erroring(tmp_path: Pa
 
     assert result.exit_code == 0, result.output
     assert "not halted" in result.output
+
+
+def _readiness_rules_path() -> Path:
+    return Path(__file__).parent.parent / "fixtures" / "rules" / "valid.yaml"
+
+
+def test_report_without_snapshots_shows_readiness_as_undetermined_and_exits_0(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "trader.sqlite3"
+    open_db(db_path).value.close()
+
+    result = runner.invoke(
+        app, ["report", "--db", str(db_path), "--rules", str(_readiness_rules_path())]
+    )
+
+    assert result.exit_code == 0
+    assert "移行条件" in result.output
+    assert "未判定" in result.output
+    assert "最終判断は kyo" in result.output
+    assert "合格" not in result.output
+
+
+def test_report_with_invalid_since_exits_1_and_mentions_format(tmp_path: Path) -> None:
+    db_path = tmp_path / "trader.sqlite3"
+    open_db(db_path).value.close()
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--db",
+            str(db_path),
+            "--rules",
+            str(_readiness_rules_path()),
+            "--since",
+            "not-a-date",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "YYYY-MM-DD" in result.output
+
+
+def test_report_with_since_before_first_snapshot_exits_1(tmp_path: Path) -> None:
+    db_path = tmp_path / "trader.sqlite3"
+    conn = open_db(db_path).value
+    with transaction(conn):
+        portfolio_repo.upsert_equity_snapshot(
+            conn,
+            "2026-01-05",
+            "paper",
+            Money(Decimal("2500")),
+            Money(Decimal("0")),
+            Money(Decimal("2500")),
+            Decimal("0"),
+            _NOW,
+        )
+    conn.close()
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--db",
+            str(db_path),
+            "--rules",
+            str(_readiness_rules_path()),
+            "--since",
+            "2026-01-01",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "trader report:" in result.output
