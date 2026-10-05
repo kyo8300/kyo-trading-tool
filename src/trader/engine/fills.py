@@ -21,6 +21,7 @@ from trader.domain.clock import Clock
 from trader.domain.models import Decision, ExitReason, Fill, OrderStatus, Side
 from trader.domain.money import Money, Price, Quantity
 from trader.domain.result import Err, Ok, Result
+from trader.ledger.benchmark_repository import delete_position_mark
 from trader.ledger.portfolio_repository import (
     delete_position,
     get_position,
@@ -35,6 +36,7 @@ from trader.ledger.repository import (
     update_order_status,
 )
 from trader.ledger.trade_closer import OpenPosition, apply_fill
+from trader.rules.loss_limits import trading_day
 
 _TERMINAL_STATUSES = frozenset({OrderStatus.filled, OrderStatus.canceled, OrderStatus.rejected})
 _ZERO_MONEY = Money(Decimal(0))
@@ -165,6 +167,11 @@ def _settle_fill(
             return Err(FillsError(upsert_result.error.message))
         return Ok(None)
     delete_position(conn, decision.ticker)
+    mark_result = delete_position_mark(
+        conn, trading_day(fill.filled_at).isoformat(), decision.ticker
+    )
+    if isinstance(mark_result, Err):
+        return Err(FillsError(mark_result.error.message))
     insert_result = insert_trade(conn, update.trade)
     if isinstance(insert_result, Err):
         return Err(FillsError(insert_result.error.message))

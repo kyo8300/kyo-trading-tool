@@ -16,13 +16,23 @@ from dataclasses import dataclass, replace
 from decimal import ROUND_FLOOR, Decimal
 
 from trader.domain.clock import Clock
-from trader.domain.models import Action, Decision, ExitReason, Origin, Position, RuleCheck
+from trader.domain.models import (
+    Action,
+    Decision,
+    ExitReason,
+    Origin,
+    Position,
+    PositionMark,
+    RuleCheck,
+)
 from trader.domain.money import Money, Quantity
 from trader.domain.result import Err, Ok, Result
+from trader.ledger.benchmark_repository import upsert_position_mark
 from trader.ledger.portfolio_repository import upsert_position
 from trader.ledger.repository import insert_decision
 from trader.market.data_provider import MarketDataProvider
 from trader.rules.exit_checks import check_exit
+from trader.rules.loss_limits import trading_day
 from trader.rules.schema import RuleSet
 
 
@@ -93,6 +103,20 @@ def evaluate_holdings(
         upsert_result = upsert_position(conn, updated_position)
         if isinstance(upsert_result, Err):
             return Err(HoldingsError(upsert_result.error.message))
+        mark = PositionMark(
+            mark_date=trading_day(now).isoformat(),
+            ticker=position.ticker,
+            qty=updated_position.qty,
+            avg_cost=updated_position.avg_cost,
+            mark_price=price,
+            unrealized_pnl=Money(
+                (price.amount - updated_position.avg_cost.amount) * updated_position.qty.shares
+            ),
+            taken_at=now,
+        )
+        mark_result = upsert_position_mark(conn, mark)
+        if isinstance(mark_result, Err):
+            return Err(HoldingsError(mark_result.error.message))
 
         signal = check_exit(updated_position, price, rules, now)
         if signal is None:
