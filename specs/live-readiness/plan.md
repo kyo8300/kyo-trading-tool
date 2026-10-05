@@ -4,7 +4,7 @@
 元 intent: `specs/live-readiness/intent.md`（approved_at: 2026-10-06）
 親 plan: `specs/ai-auto-trader/plan.md`（タスク粒度・書式の先例）
 作成日: 2026-10-06
-状態: draft
+状態: approved
 
 > **kyo へ（これが自律ループ前の最後の介入点）**
 > - タスクは 12 個。縦切り（1 タスク = 1 つの動く経路）で、依存の薄いものは並列グループにまとめた。
@@ -332,5 +332,5 @@ spec に根拠があるものだけを挙げる。「未確認」は隠さない
 
 ## 承認
 
-approved_by:
-approved_at:
+approved_by: kyo
+approved_at: 2026-10-06
