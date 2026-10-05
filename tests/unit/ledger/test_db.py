@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from trader.ledger.db import apply_migrations, open_db, run_in_transaction, transaction
+from trader.ledger.db import (
+    _migration_files,
+    apply_migrations,
+    open_db,
+    run_in_transaction,
+    transaction,
+)
 
 
 def test_open_db_creates_parent_dir_and_applies_migrations(tmp_path: Path) -> None:
@@ -50,7 +56,7 @@ def test_apply_migrations_is_idempotent(tmp_path: Path) -> None:
     assert third.is_ok()
     versions = [row["version"] for row in conn.execute("SELECT version FROM schema_migrations")]
     assert len(versions) == len(set(versions))
-    assert len(versions) == 1
+    assert sorted(versions) == [name for name, _ in _migration_files()]
     conn.close()
 
 
