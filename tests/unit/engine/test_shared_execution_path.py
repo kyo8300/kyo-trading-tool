@@ -72,7 +72,8 @@ def test_ac14_execution_py_calls_all_three_guarded_functions() -> None:
 def test_ac14_scanner_flags_a_planted_bypass(tmp_path: Path) -> None:
     planted = tmp_path / "planted.py"
     planted.write_text(
-        "def f(c):\n    return poll_and_settle(c)\n\ndef g(m):\n    return order_executor.execute(1)\n",
+        "def f(c):\n    return poll_and_settle(c)\n\n"
+        "def g(m):\n    return order_executor.execute(1)\n",
         encoding="utf-8",
     )
     assert _offenders(tmp_path) == [planted]
