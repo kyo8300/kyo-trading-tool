@@ -14,15 +14,21 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import typer
 
 if TYPE_CHECKING:
+    from trader.broker.broker import Broker
+    from trader.config.settings import LiveSettings, PaperSettings
     from trader.domain.result import Result
+    from trader.engine.manual_close import CloseOutcome
+    from trader.market.alpaca_data import AlpacaMarketData
     from trader.report import Period
+    from trader.rules import DerivedLimits, RuleSet
     from trader.sources import AdapterRegistry
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -169,59 +175,58 @@ def ingest(
 _DEFAULT_LOCK_PATH = "var/run-cycle.lock"
 
 
-@app.command("run-cycle")
-def run_cycle() -> None:
-    """Run a single decision/order cycle (R-8). Refuses to run under
-    `TRADER_ENV=test` (N-9); tests call `trader.engine.cycle.run_cycle` directly."""
-    import time
+@dataclass(frozen=True)
+class _TradingContext:
+    settings: PaperSettings | LiveSettings
+    rule_set: RuleSet
+    limits: DerivedLimits
+    rule_set_sha256: str
+    conn: sqlite3.Connection
+    broker: Broker
+    market: AlpacaMarketData
 
-    from trader.analysis.llm_client import AnthropicClient
+
+def _fail(command: str, message: str) -> NoReturn:
+    typer.echo(f"trader {command}: {message}", err=True)
+    raise typer.Exit(code=1)
+
+
+def _refuse_in_test_env(command: str) -> None:
+    if os.environ.get("TRADER_ENV") == "test":
+        _fail(command, "テスト環境では実行しません (TRADER_ENV=test)")
+
+
+def _build_trading_context(command: str) -> _TradingContext:
+    """Settings, lock check, rules, DB, broker and market data shared by the
+    trading commands. Exits with status 1 and a human-readable message on failure."""
     from trader.broker.alpaca_broker import AlpacaBroker
     from trader.config.settings import LiveSettings, PaperSettings, load_settings
-    from trader.domain.clock import SystemClock
-    from trader.domain.money import Money
     from trader.domain.result import Err
-    from trader.engine.cycle import CycleDeps
-    from trader.engine.cycle import run_cycle as run_cycle_engine
     from trader.ledger.db import open_db
     from trader.market.alpaca_data import AlpacaMarketData
     from trader.rules import derive_limits, load_rules, verify_lock
     from trader.rules.lock import sha256_of_file
 
-    if os.environ.get("TRADER_ENV") == "test":
-        typer.echo("trader run-cycle: テスト環境では実行しません (TRADER_ENV=test)", err=True)
-        raise typer.Exit(code=1)
-
     settings_result = load_settings(os.environ)
     if isinstance(settings_result, Err):
-        typer.echo(f"trader run-cycle: {settings_result.error.message}", err=True)
-        raise typer.Exit(code=1)
+        _fail(command, settings_result.error.message)
     settings = settings_result.value
 
     rules_path = settings.TRADER_RULES_PATH
-    lock_path = rules_path.parent / "trading-rules.lock"
-    verify_result = verify_lock(rules_path, lock_path)
+    verify_result = verify_lock(rules_path, rules_path.parent / "trading-rules.lock")
     if isinstance(verify_result, Err):
-        typer.echo(f"trader run-cycle: {verify_result.error.message}", err=True)
-        raise typer.Exit(code=1)
-
+        _fail(command, verify_result.error.message)
     rules_result = load_rules(rules_path)
     if isinstance(rules_result, Err):
-        typer.echo(f"trader run-cycle: {rules_result.error.message}", err=True)
-        raise typer.Exit(code=1)
+        _fail(command, rules_result.error.message)
     rule_set = rules_result.value
-    limits = derive_limits(rule_set)
-
     sha_result = sha256_of_file(rules_path)
     if isinstance(sha_result, Err):
-        typer.echo(f"trader run-cycle: {sha_result.error.message}", err=True)
-        raise typer.Exit(code=1)
-    rule_set_sha256 = sha_result.value
+        _fail(command, sha_result.error.message)
 
     db_result = open_db(settings.TRADER_DB_PATH)
     if isinstance(db_result, Err):
-        typer.echo(f"trader run-cycle: {db_result.error.message}", err=True)
-        raise typer.Exit(code=1)
+        _fail(command, db_result.error.message)
     conn = db_result.value
 
     if isinstance(settings, PaperSettings):
@@ -241,27 +246,51 @@ def run_cycle() -> None:
         )
     if isinstance(broker_result, Err):
         conn.close()
-        typer.echo(f"trader run-cycle: {broker_result.error.message}", err=True)
-        raise typer.Exit(code=1)
-    broker = broker_result.value
+        _fail(command, broker_result.error.message)
+    return _TradingContext(
+        settings,
+        rule_set,
+        derive_limits(rule_set),
+        sha_result.value,
+        conn,
+        broker_result.value,
+        market,
+    )
 
+
+@app.command("run-cycle")
+def run_cycle() -> None:
+    """Run a single decision/order cycle (R-8). Refuses to run under
+    `TRADER_ENV=test` (N-9); tests call `trader.engine.cycle.run_cycle` directly."""
+    import time
+
+    from trader.analysis.llm_client import AnthropicClient
+    from trader.domain.clock import SystemClock
+    from trader.domain.money import Money
+    from trader.domain.result import Err
+    from trader.engine.cycle import CycleDeps
+    from trader.engine.cycle import run_cycle as run_cycle_engine
+
+    _refuse_in_test_env("run-cycle")
+    ctx = _build_trading_context("run-cycle")
+    settings = ctx.settings
     llm = AnthropicClient.create(settings.ANTHROPIC_API_KEY, settings.ANTHROPIC_MODEL)
 
     deps = CycleDeps(
         mode=settings.mode,
-        rules=rule_set,
-        limits=limits,
-        rule_set_sha256=rule_set_sha256,
-        conn=conn,
-        broker=broker,
-        market=market,
+        rules=ctx.rule_set,
+        limits=ctx.limits,
+        rule_set_sha256=ctx.rule_set_sha256,
+        conn=ctx.conn,
+        broker=ctx.broker,
+        market=ctx.market,
         # `AnthropicClient` duck-types `LlmClient` (has `.model` / `.complete`), but
         # mypy treats a frozen dataclass's slot as read-only against the protocol's
         # plain (mutable-looking) attribute declaration -- a known variance quirk,
         # not a real type mismatch.
         llm=llm,  # type: ignore[arg-type]
         clock=SystemClock(),
-        capital=Money(rule_set.capital_usd),
+        capital=Money(ctx.rule_set.capital_usd),
         sleep=time.sleep,
         lock_path=Path(os.environ.get("TRADER_LOCK_PATH", _DEFAULT_LOCK_PATH)),
     )
@@ -269,11 +298,10 @@ def run_cycle() -> None:
     try:
         result = run_cycle_engine(deps)
     finally:
-        conn.close()
+        ctx.conn.close()
 
     if isinstance(result, Err):
-        typer.echo(f"trader run-cycle: {result.error.message}", err=True)
-        raise typer.Exit(code=1)
+        _fail("run-cycle", result.error.message)
 
     outcome = result.value
     typer.echo(
@@ -284,8 +312,61 @@ def run_cycle() -> None:
         typer.echo(f"  detail: {outcome.error_summary}")
     if outcome.candidates_skipped_reason:
         typer.echo(f"  candidates: skipped ({outcome.candidates_skipped_reason})")
+    if outcome.benchmark_error:
+        typer.echo(f"  benchmark: {outcome.benchmark_error}")
     if outcome.outcome == "error":
         raise typer.Exit(code=1)
+
+
+@app.command("close")
+def close(
+    ticker: str = typer.Argument(..., help="Held ticker to sell in full"),
+    reason: str | None = typer.Option(None, "--reason", help="Why you are closing (recorded)"),
+) -> None:
+    """Manually sell the whole position in TICKER via the engine's shared order path."""
+    import time
+
+    from trader.domain.clock import SystemClock
+    from trader.domain.result import Err
+    from trader.engine.manual_close import CloseDeps, close_position
+
+    _refuse_in_test_env("close")
+    ctx = _build_trading_context("close")
+    deps = CloseDeps(
+        mode=ctx.settings.mode,
+        rules=ctx.rule_set,
+        rule_set_sha256=ctx.rule_set_sha256,
+        conn=ctx.conn,
+        broker=ctx.broker,
+        market=ctx.market,
+        clock=SystemClock(),
+        sleep=time.sleep,
+        lock_path=Path(os.environ.get("TRADER_LOCK_PATH", _DEFAULT_LOCK_PATH)),
+    )
+    try:
+        result = close_position(deps, ticker.upper(), reason)
+    finally:
+        ctx.conn.close()
+    if isinstance(result, Err):
+        _fail("close", result.error.message)
+    _echo_close_outcome(result.value)
+
+
+def _echo_close_outcome(outcome: CloseOutcome) -> None:
+    avg = outcome.avg_fill_price.amount if outcome.avg_fill_price else "-"
+    typer.echo(
+        f"trader close: decision {outcome.decision_id} / order {outcome.order_id} "
+        f"({outcome.order_status}) / filled {outcome.filled_qty} @ {avg}"
+    )
+    if outcome.trade is not None:
+        typer.echo(f"  trade {outcome.trade.id} realized {outcome.trade.realized_pnl.amount}")
+    if outcome.slot_freed:
+        typer.echo("  枠が 1 つ空きました。次の run-cycle で新規買いが走る可能性があります")
+    else:
+        typer.echo(
+            f"  約定済み {outcome.filled_qty} 株 (status: {outcome.order_status})。"
+            "残りは次の run-cycle のポーリング対象になりません(v1 の制限)"
+        )
 
 
 @app.command("approve")

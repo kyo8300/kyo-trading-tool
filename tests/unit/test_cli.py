@@ -30,6 +30,7 @@ COMMANDS: list[list[str]] = [
     ["rules", "approve", "--help"],
     ["resume", "--help"],
     ["status", "--help"],
+    ["close", "--help"],
 ]
 
 
@@ -483,3 +484,9 @@ def test_report_with_since_before_first_snapshot_exits_1(tmp_path: Path) -> None
 
     assert result.exit_code == 1
     assert "trader report:" in result.output
+
+
+def test_close_refuses_to_run_in_the_test_environment() -> None:
+    result = runner.invoke(app, ["close", "ABCD"])
+    assert result.exit_code == 1
+    assert "テスト環境" in result.output
