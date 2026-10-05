@@ -18,7 +18,8 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from datetime import time as dt_time
 from decimal import Decimal
 from typing import Any
 
@@ -232,29 +233,39 @@ class AlpacaMarketData:
         )
 
     def daily_bars(self, ticker: str, days: int = 20) -> Result[tuple[Bar, ...], MarketError]:
+        start = self._now() - timedelta(days=_BARS_LOOKBACK_DAYS)
+        result = self._fetch_bars(ticker, start, op=f"daily_bars({ticker})")
+        if isinstance(result, Err):
+            return result
+        return Ok(result.value[-days:] if days > 0 else ())
+
+    def daily_bars_since(self, ticker: str, start: date) -> Result[tuple[Bar, ...], MarketError]:
+        start_dt = datetime.combine(start, dt_time.min, tzinfo=UTC)
+        return self._fetch_bars(ticker, start_dt, op=f"daily_bars_since({ticker})")
+
+    def _fetch_bars(
+        self, ticker: str, start_dt: datetime, *, op: str
+    ) -> Result[tuple[Bar, ...], MarketError]:
         request = StockBarsRequest(
             symbol_or_symbols=ticker,
             timeframe=TimeFrame(1, TimeFrameUnit.Day),
-            start=self._now() - timedelta(days=_BARS_LOOKBACK_DAYS),
+            start=start_dt,
         )
-        raw_result = self._call_with_retry(
-            lambda: self._data_client.get_stock_bars(request), op=f"daily_bars({ticker})"
-        )
+        raw_result = self._call_with_retry(lambda: self._data_client.get_stock_bars(request), op=op)
         if isinstance(raw_result, Err):
             return raw_result
 
         raw_value = raw_result.value
         if not isinstance(raw_value, dict) or ticker not in raw_value:
             return Err(MarketError(f"no bars data returned for {ticker}"))
-        raw_bars = raw_value[ticker]
         bars: list[Bar] = []
-        for raw_bar in raw_bars:
+        for raw_bar in raw_value[ticker]:
             bar_result = _to_bar(ticker, raw_bar)
             if isinstance(bar_result, Err):
                 return bar_result
             bars.append(bar_result.value)
         bars.sort(key=lambda bar: bar.date)
-        return Ok(tuple(bars[-days:]) if days > 0 else ())
+        return Ok(tuple(bars))
 
     def latest_price(self, ticker: str) -> Result[Price, MarketError]:
         request = StockLatestTradeRequest(symbol_or_symbols=ticker)

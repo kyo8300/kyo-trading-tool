@@ -54,6 +54,10 @@ class MarketDataProvider(Protocol):
         """Return up to `days` most recent daily bars for `ticker`, oldest first."""
         ...
 
+    def daily_bars_since(self, ticker: str, start: date) -> Result[tuple[Bar, ...], MarketError]:
+        """Return all daily bars for `ticker` from `start` (inclusive), oldest first."""
+        ...
+
     def latest_price(self, ticker: str) -> Result[Price, MarketError]:
         """Return the latest traded price for `ticker`."""
         ...

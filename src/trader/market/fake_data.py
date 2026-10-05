@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+from datetime import date
 
 from trader.domain.money import Price
 from trader.domain.result import Err, Ok, Result
@@ -30,6 +31,14 @@ class FakeMarketData:
         if bars is None:
             return Err(MarketError(f"no bars configured for ticker {ticker}"))
         return Ok(bars[-days:])
+
+    def daily_bars_since(self, ticker: str, start: date) -> Result[tuple[Bar, ...], MarketError]:
+        if "daily_bars_since" in self.errors:
+            return Err(MarketError("daily_bars_since is set to fail"))
+        bars = self.bars.get(ticker)
+        if bars is None:
+            return Err(MarketError(f"no bars configured for ticker {ticker}"))
+        return Ok(tuple(bar for bar in bars if bar.date >= start))
 
     def latest_price(self, ticker: str) -> Result[Price, MarketError]:
         if "latest_price" in self.errors:
