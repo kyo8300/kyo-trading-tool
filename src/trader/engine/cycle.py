@@ -20,7 +20,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -33,6 +33,7 @@ from trader.domain.clock import Clock
 from trader.domain.models import Trade
 from trader.domain.money import Money
 from trader.domain.result import Err, Ok, Result
+from trader.engine.benchmark import benchmark_start, record_benchmark
 from trader.engine.candidates import evaluate_candidates
 from trader.engine.execution import ExecutionDeps, execute_decisions
 from trader.engine.holdings import HoldingsOutcome, evaluate_holdings
@@ -48,7 +49,7 @@ from trader.ledger.portfolio_repository import (
     upsert_equity_snapshot,
 )
 from trader.ledger.source_repository import list_mentions
-from trader.market.data_provider import MarketDataProvider
+from trader.market.data_provider import MarketClock, MarketDataProvider
 from trader.rules import loss_limits
 from trader.rules.schema import DerivedLimits, RuleSet
 
@@ -78,6 +79,8 @@ class CycleOutcome:
     # Set when candidate evaluation (and the LLM call) was skipped for this
     # cycle, e.g. because every position slot is already taken.
     candidates_skipped_reason: str | None = None
+    # Set when recording SPY closes failed; never stops the cycle (LR-13).
+    benchmark_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +163,7 @@ def _finish(
     fills: int,
     clock: Clock,
     candidates_skipped_reason: str | None = None,
+    benchmark_error: str | None = None,
 ) -> Result[CycleOutcome, CycleError]:
     finish_result = finish_cycle(conn, cycle_id, clock.now(), outcome, error_summary)
     if isinstance(finish_result, Err):
@@ -189,6 +193,7 @@ def _finish(
             fills=fills,
             error_summary=error_summary,
             candidates_skipped_reason=candidates_skipped_reason,
+            benchmark_error=benchmark_error,
         )
     )
 
@@ -335,6 +340,23 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
         )
     market_clock = market_clock_result.value
 
+    # SPY recording must never stop the cycle (LR-13): failure becomes
+    # `benchmark_error` on the outcome.
+    now = deps.clock.now()
+    benchmark_result = record_benchmark(conn, deps.market, benchmark_start(conn, now), now)
+    benchmark_error = benchmark_result.error.message if isinstance(benchmark_result, Err) else None
+    result = _run_after_clock(deps, conn, cycle_id, market_clock)
+    if isinstance(result, Ok) and benchmark_error is not None:
+        return Ok(replace(result.value, benchmark_error=benchmark_error))
+    return result
+
+
+def _run_after_clock(
+    deps: CycleDeps,
+    conn: sqlite3.Connection,
+    cycle_id: str,
+    market_clock: MarketClock,
+) -> Result[CycleOutcome, CycleError]:
     positions = list_positions(conn)
     holdings_result = evaluate_holdings(
         conn,
