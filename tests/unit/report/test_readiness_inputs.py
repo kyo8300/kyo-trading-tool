@@ -539,6 +539,44 @@ def test_ac17_partial_end_marks_name_the_tickers_without_a_mark(conn) -> None:
     _mark(conn, "2026-09-18", "AAA", "4")
     inputs = _ok(conn)
     assert any("position_marks" in m and "BBB" in m and "AAA" not in m for m in inputs.missing)
+    assert inputs.unreal_end_by_ticker is None
+
+
+def test_ac17_partial_end_marks_leave_unreal_end_undetermined(conn) -> None:
+    for day in ("2026-09-14", "2026-09-18"):
+        _snapshot(conn, day)
+    _hold(conn, "AAA", "2026-09-14")
+    _hold(conn, "BBB", "2026-09-14")
+    _mark(conn, "2026-09-18", "AAA", "4")
+    inputs = _ok(conn)
+    assert inputs.unreal_end_by_ticker is None
+    assert any(m.startswith("position_marks(") and "BBB" in m for m in inputs.missing)
+
+
+def test_ac17_since_partial_start_marks_leave_start_undetermined(conn) -> None:
+    for day in ("2026-09-14", "2026-09-16", "2026-09-18"):
+        _snapshot(conn, day)
+    _hold(conn, "AAA", "2026-09-14")
+    _hold(conn, "BBB", "2026-09-14")
+    _mark(conn, "2026-09-16", "AAA", "2")
+    _mark(conn, "2026-09-18", "AAA", "4")
+    _mark(conn, "2026-09-18", "BBB", "1")
+    inputs = _ok(conn, date(2026, 9, 16))
+    assert inputs.unreal_start_by_ticker is None
+    assert "position_marks(S)" in inputs.missing
+
+
+def test_ac17_paper_start_day_partial_marks_stay_zero(conn) -> None:
+    for day in ("2026-09-14", "2026-09-18"):
+        _snapshot(conn, day)
+    _hold(conn, "AAA", "2026-09-14")
+    _hold(conn, "BBB", "2026-09-14")
+    _mark(conn, "2026-09-14", "AAA", "2")
+    _mark(conn, "2026-09-18", "AAA", "4")
+    _mark(conn, "2026-09-18", "BBB", "1")
+    inputs = _ok(conn)
+    assert inputs.unreal_start_by_ticker is not None
+    assert "position_marks(S)" not in inputs.missing
 
 
 def test_ac17_since_after_end_is_err(conn) -> None:

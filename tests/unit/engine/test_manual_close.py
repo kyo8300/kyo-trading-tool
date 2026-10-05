@@ -430,3 +430,45 @@ def test_live_rerun_with_changed_position_qty_creates_a_new_decision(tmp_path: P
     assert new.id not in first.error.message
     assert broker.submitted == []
     conn.close()
+
+
+def _live_rerun_reuses_decision_at(tmp_path: Path, price: str, shares: int) -> None:
+    conn, sha, rules = _setup(tmp_path)
+    held = Position(
+        ticker="ZZZZ",
+        qty=Quantity(shares),
+        avg_cost=Price(_AVG_COST),
+        opened_at=_NOW - timedelta(days=3),
+        high_watermark=Price(_AVG_COST),
+        partial_tp_done=False,
+    )
+    assert isinstance(upsert_position(conn, held), Ok)
+    market = FakeMarketData(prices={"ZZZZ": Price(Decimal(price))}, bars={}, clock=_OPEN)
+    broker = _FillBroker(Price(Decimal(price)))
+    deps = _deps(conn, sha, rules, broker, TradingMode.live, market)
+
+    first = close_position(deps, "ZZZZ", None)
+    assert isinstance(first, Err)
+    decision_id = list_decisions(conn)[0].id
+    approved = record_human_approval(conn, decision_id, FixedClock(_NOW), _OPEN)
+    assert isinstance(approved, Ok)
+    conn.commit()
+    second = close_position(deps, "ZZZZ", None)
+
+    assert isinstance(second, Ok)
+    assert len(list_decisions(conn)) == 1
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].qty == Quantity(shares)
+    conn.close()
+
+
+def test_live_subcent_price_123_455_x3_reuses_approved_decision_and_places_order(
+    tmp_path: Path,
+) -> None:
+    _live_rerun_reuses_decision_at(tmp_path, "123.455", 3)
+
+
+def test_live_subcent_price_50_0001_x1_reuses_approved_decision_and_places_order(
+    tmp_path: Path,
+) -> None:
+    _live_rerun_reuses_decision_at(tmp_path, "50.0001", 1)
