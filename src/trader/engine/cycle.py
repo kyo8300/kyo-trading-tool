@@ -30,16 +30,14 @@ from trader.analysis.analyst import LlmClient
 from trader.broker.broker import Broker
 from trader.config.mode import TradingMode
 from trader.domain.clock import Clock
-from trader.domain.models import Action, Decision, ExitReason, RuleCheck, Trade
+from trader.domain.models import Trade
 from trader.domain.money import Money
 from trader.domain.result import Err, Ok, Result
-from trader.engine.approval import resolve_approval
 from trader.engine.candidates import evaluate_candidates
-from trader.engine.fills import poll_and_settle
+from trader.engine.execution import ExecutionDeps, execute_decisions
 from trader.engine.holdings import HoldingsOutcome, evaluate_holdings
 from trader.engine.kill_switch import is_halted
 from trader.engine.kill_switch import trigger as trigger_kill_switch
-from trader.engine.order_executor import execute
 from trader.ledger.portfolio_repository import (
     finish_cycle,
     insert_cycle,
@@ -50,7 +48,7 @@ from trader.ledger.portfolio_repository import (
     upsert_equity_snapshot,
 )
 from trader.ledger.source_repository import list_mentions
-from trader.market.data_provider import MarketClock, MarketDataProvider
+from trader.market.data_provider import MarketDataProvider
 from trader.rules import loss_limits
 from trader.rules.schema import DerivedLimits, RuleSet
 
@@ -102,7 +100,7 @@ class CycleDeps:
     lock_path: Path | None = None
 
 
-def _acquire_lock(lock_path: Path) -> Result[IO[str], CycleError]:
+def acquire_lock(lock_path: Path) -> Result[IO[str], CycleError]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+")
     try:
@@ -113,11 +111,22 @@ def _acquire_lock(lock_path: Path) -> Result[IO[str], CycleError]:
     return Ok(handle)
 
 
-def _release_lock(handle: IO[str]) -> None:
+def release_lock(handle: IO[str]) -> None:
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     finally:
         handle.close()
+
+
+def _execution_deps(deps: CycleDeps) -> ExecutionDeps:
+    return ExecutionDeps(
+        mode=deps.mode,
+        broker=deps.broker,
+        clock=deps.clock,
+        sleep=deps.sleep,
+        poll_timeout_s=deps.poll_timeout_s,
+        poll_interval_s=deps.poll_interval_s,
+    )
 
 
 def _prior_peak_equity(conn: sqlite3.Connection, capital: Money, today: str) -> Money:
@@ -189,14 +198,14 @@ def run_cycle(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
     if deps.lock_path is None:
         return _run_locked(deps)
 
-    lock_result = _acquire_lock(deps.lock_path)
+    lock_result = acquire_lock(deps.lock_path)
     if isinstance(lock_result, Err):
         return lock_result
     handle = lock_result.value
     try:
         return _run_locked(deps)
     finally:
-        _release_lock(handle)
+        release_lock(handle)
 
 
 def _evaluate_risk(
@@ -356,9 +365,14 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
         orders_count = 0
         fills_count = 0
         if market_clock.is_open:
-            orders_count, fills_count = _execute_passed_decisions(
-                deps, conn, holdings_outcome.decisions, holdings_outcome.exit_reasons, market_clock
+            summary = execute_decisions(
+                _execution_deps(deps),
+                conn,
+                holdings_outcome.decisions,
+                holdings_outcome.exit_reasons,
+                market_clock,
             )
+            orders_count, fills_count = summary.orders, summary.fills
         return _finish(
             conn,
             cycle_id,
@@ -385,9 +399,14 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
         orders_count = 0
         fills_count = 0
         if market_clock.is_open:
-            orders_count, fills_count = _execute_passed_decisions(
-                deps, conn, holdings_outcome.decisions, holdings_outcome.exit_reasons, market_clock
+            summary = execute_decisions(
+                _execution_deps(deps),
+                conn,
+                holdings_outcome.decisions,
+                holdings_outcome.exit_reasons,
+                market_clock,
             )
+            orders_count, fills_count = summary.orders, summary.fills
         return _finish(
             conn,
             cycle_id,
@@ -434,56 +453,11 @@ def _run_locked(deps: CycleDeps) -> Result[CycleOutcome, CycleError]:
         return _finish(conn, cycle_id, "ok", None, decisions_count, 0, 0, deps.clock)
 
     all_decisions = (*holdings_outcome.decisions, *candidates_outcome.decisions)
-    orders_count, fills_count = _execute_passed_decisions(
-        deps, conn, all_decisions, holdings_outcome.exit_reasons, market_clock
+    summary = execute_decisions(
+        _execution_deps(deps), conn, all_decisions, holdings_outcome.exit_reasons, market_clock
     )
+    orders_count, fills_count = summary.orders, summary.fills
 
     return _finish(
         conn, cycle_id, "ok", None, decisions_count, orders_count, fills_count, deps.clock
     )
-
-
-def _execute_passed_decisions(
-    deps: CycleDeps,
-    conn: sqlite3.Connection,
-    decisions: tuple[Decision, ...],
-    exit_reasons: dict[str, ExitReason],
-    market_clock: MarketClock,
-) -> tuple[int, int]:
-    orders_count = 0
-    fills_count = 0
-    for decision in decisions:
-        if decision.rule_check is not RuleCheck.passed or decision.action not in (
-            Action.buy,
-            Action.sell,
-        ):
-            continue
-
-        approval_result = resolve_approval(decision, deps.mode, conn, deps.clock, market_clock)
-        if isinstance(approval_result, Err):
-            continue
-
-        exec_result = execute(approval_result.value, conn, deps.broker, deps.clock, deps.mode)
-        if isinstance(exec_result, Err):
-            continue
-        order = exec_result.value
-        orders_count += 1
-
-        exit_reason = exit_reasons.get(decision.id)
-        poll_result = poll_and_settle(
-            conn,
-            deps.broker,
-            deps.clock,
-            deps.sleep,
-            order.client_order_id,
-            order.id,
-            decision,
-            order.side,
-            exit_reason,
-            deps.poll_timeout_s,
-            deps.poll_interval_s,
-        )
-        if isinstance(poll_result, Ok):
-            fills_count += poll_result.value.fills_recorded
-
-    return orders_count, fills_count
