@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import cast
@@ -320,3 +321,37 @@ def get_rule_set(conn: sqlite3.Connection, sha256: str) -> sqlite3.Row | None:
     """Return the raw row for the rule set with the given hash, if recorded."""
     row = conn.execute("SELECT * FROM rule_sets WHERE sha256 = ?", (sha256,)).fetchone()
     return cast("sqlite3.Row | None", row)
+
+
+# --- halted cycles (live-readiness LR-7) ------------------------------------
+
+_ENGINE_ALREADY_HALTED = "engine is halted"
+
+
+@dataclass(frozen=True, slots=True)
+class HaltedCycle:
+    """A cycle stopped by a loss limit (not one skipped because already halted)."""
+
+    id: str
+    started_at: datetime
+    error_summary: str | None
+
+
+def list_halted_cycles(conn: sqlite3.Connection) -> tuple[HaltedCycle, ...]:
+    """Return cycles that halted the engine, oldest first."""
+    rows = conn.execute(
+        """
+        SELECT id, started_at, error_summary FROM cycles
+        WHERE outcome = 'halted' AND (error_summary IS NULL OR error_summary <> ?)
+        ORDER BY started_at ASC
+        """,
+        (_ENGINE_ALREADY_HALTED,),
+    ).fetchall()
+    return tuple(
+        HaltedCycle(
+            id=row["id"],
+            started_at=_dt_from_text(row["started_at"]),
+            error_summary=row["error_summary"],
+        )
+        for row in rows
+    )

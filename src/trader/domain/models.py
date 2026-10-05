@@ -31,6 +31,7 @@ class Action(StrEnum):
 class Origin(StrEnum):
     llm = "llm"
     rule_exit = "rule_exit"
+    manual = "manual"
 
 
 class RuleCheck(StrEnum):
@@ -59,6 +60,7 @@ class ExitReason(StrEnum):
     trailing_stop = "trailing_stop"
     max_holding_days = "max_holding_days"
     llm = "llm"
+    manual = "manual"
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,3 +219,26 @@ class ExitSignal:
     reason: ExitReason
     fraction: Decimal
     trigger_price: Price
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkPrice:
+    """A daily close of a benchmark ticker (e.g. SPY) used by `report` (LR-4)."""
+
+    ticker: str
+    price_date: str
+    close: Price
+    taken_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PositionMark:
+    """A per-day mark-to-market of one held ticker (LR-14)."""
+
+    mark_date: str
+    ticker: str
+    qty: Quantity
+    avg_cost: Price
+    mark_price: Price
+    unrealized_pnl: Money
+    taken_at: datetime
