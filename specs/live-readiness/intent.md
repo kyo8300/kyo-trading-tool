@@ -2,7 +2,7 @@
 
 - 作成日: 2026-10-06
 - 更新日: 2026-10-06（kyo の回答で Q1〜Q4 を決定に変更）
-- 状態: draft
+- 状態: approved
 - 親: `specs/ai-auto-trader/`（spec Q5 の移行条件、R-22 / R-23 の report を変更対象とする）
 
 ## 問題
@@ -76,5 +76,5 @@ paper 運用は 2026-09-18 頃から cron で回り、今日で約 19 日（営�
 
 ## 承認
 
-approved_by:
-approved_at:
+approved_by: kyo
+approved_at: 2026-10-06
