@@ -382,6 +382,9 @@ def report(
     to: str | None = typer.Option(
         None, "--to", help="Report period end date, YYYY-MM-DD (default: unbounded)"
     ),
+    since: str | None = typer.Option(
+        None, "--since", help="Readiness start date, YYYY-MM-DD (default: first snapshot)"
+    ),
 ) -> None:
     """Print the performance report: metrics (R-22) and live estimate (R-23)."""
     from datetime import date as date_cls
@@ -396,6 +399,8 @@ def report(
     )
     from trader.ledger.repository import list_all_fills, list_decisions, list_orders
     from trader.report import Period, compute, estimate, filter_trades_by_period, render_report
+    from trader.report.readiness import evaluate_readiness
+    from trader.report.readiness_inputs import load_readiness_inputs
     from trader.rules import load_rules
 
     rules_path = Path(rules or os.environ.get("TRADER_RULES_PATH", _DEFAULT_RULES_PATH))
@@ -418,6 +423,11 @@ def report(
         typer.echo("trader report: --from/--to must be YYYY-MM-DD", err=True)
         raise typer.Exit(code=1) from None
     period = Period(start=period_start, end=period_end)
+    try:
+        since_day = date_cls.fromisoformat(since) if since else None
+    except ValueError:
+        typer.echo("trader report: --since must be YYYY-MM-DD", err=True)
+        raise typer.Exit(code=1) from None
 
     db_result = open_db(db_path)
     if isinstance(db_result, Err):
@@ -456,7 +466,15 @@ def report(
             decision.id: decision for decision in decisions if decision.id in entry_decision_ids
         }
 
-        output = render_report(metrics, live_estimate, period_trades, entry_decisions, period)
+        inputs_result = load_readiness_inputs(conn, rule_set, since_day)
+        if isinstance(inputs_result, Err):
+            typer.echo(f"trader report: {inputs_result.error.message}", err=True)
+            raise typer.Exit(code=1)
+        readiness = evaluate_readiness(inputs_result.value)
+
+        output = render_report(
+            metrics, live_estimate, period_trades, entry_decisions, period, readiness=readiness
+        )
     finally:
         conn.close()
 

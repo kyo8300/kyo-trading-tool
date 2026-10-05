@@ -1,3 +1,4 @@
+# ruff: noqa: RUF001
 """Text rendering for `trader report` (R-22, R-23, AC-33).
 
 `render_report` is a pure function: it only formats already-computed
@@ -13,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from trader.domain.models import Decision, Trade
 from trader.report.live_estimate import LiveEstimate
 from trader.report.metrics import Metrics, Period
+from trader.report.readiness import BenchmarkPoint, Readiness, Verdict
 
 _RATIONALE_EXCERPT_LEN = 200
 
@@ -108,12 +110,72 @@ def _render_trades(trades: Sequence[Trade], entry_decisions: Mapping[str, Decisi
     return lines
 
 
+_VERDICT_LABELS = {
+    Verdict.met: "満たした",
+    Verdict.unmet: "未達",
+    Verdict.undetermined: "未判定",
+    Verdict.needs_review: "要確認",
+}
+
+
+def _fmt_pct(value: object) -> str:
+    return "未取得" if value is None else f"{value}%"
+
+
+def _fmt_day(day: object) -> str:
+    return "なし" if day is None else str(day)
+
+
+def _benchmark_note(start: BenchmarkPoint | None, end: BenchmarkPoint | None) -> str:
+    if start is None or end is None:
+        return "close(S) → close(E)、配当含まず"
+    note = f"close({start.day}) → close({end.day})、配当含まず"
+    if start.substituted or end.substituted:
+        note += "、代用: 取得日の近傍営業日の終値"
+    return note
+
+
+def _summary_line(readiness: Readiness) -> str:
+    parts = []
+    for verdict in (Verdict.unmet, Verdict.undetermined, Verdict.needs_review):
+        numbers = [c.number for c in readiness.conditions if c.verdict == verdict]
+        parts.append(f"{_VERDICT_LABELS[verdict]} {len(numbers)} 件 ({', '.join(numbers)})")
+    return " / ".join(parts) + "。最終判断は kyo"
+
+
+def render_readiness(readiness: Readiness) -> list[str]:
+    """Render the paper -> small-live readiness section (LR-9..LR-11)."""
+    realized = readiness.realized_pnl.amount if readiness.realized_pnl is not None else "未取得"
+    unrealized = (
+        readiness.unrealized_pnl.amount if readiness.unrealized_pnl is not None else "未取得"
+    )
+    elapsed = "なし" if readiness.elapsed_days is None else f"{readiness.elapsed_days} 日"
+    lines = [
+        "## 移行条件（paper → 少額実弾）",
+        f"起点日: {_fmt_day(readiness.start_date)} / 評価日: {_fmt_day(readiness.end_date)} "
+        f"/ 経過日数: {elapsed}",
+        f"ポートフォリオ損益率 P: {_fmt_pct(readiness.p_pct)}"
+        f"（実現 {realized} / 評価 {unrealized}）",
+        f"コスト控除後 P_net: {_fmt_pct(readiness.p_net_pct)}",
+        f"SPY リターン B: {_fmt_pct(readiness.benchmark_pct)}"
+        f"（{_benchmark_note(readiness.benchmark_start, readiness.benchmark_end)}）",
+    ]
+    for cond in readiness.conditions:
+        lines.append(f"条件 {cond.number}: {_VERDICT_LABELS[cond.verdict]} — {cond.detail}")
+    if readiness.missing:
+        names = ", ".join(readiness.missing)
+        lines.append(f"不足データ: {names}(`run-cycle` が 1 回走れば記録されます)")
+    lines.append(_summary_line(readiness))
+    return lines
+
+
 def render_report(
     metrics: Metrics,
     estimate: LiveEstimate,
     trades: Sequence[Trade],
     entry_decisions: Mapping[str, Decision],
     period: Period,
+    readiness: Readiness | None = None,
 ) -> str:
     """Render `metrics`/`estimate`/`trades` as a headed, human-readable report."""
     sections = [
@@ -125,5 +187,6 @@ def render_report(
         *_render_exit_reason_counts(metrics),
         *_render_open_positions(metrics),
         *_render_trades(trades, entry_decisions),
+        *(render_readiness(readiness) if readiness is not None else []),
     ]
     return "\n".join(sections) + "\n"
