@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from trader.domain.models import ExitReason, Trade
+from trader.domain.models import ExitReason, Position, Trade
 from trader.domain.money import Money
 from trader.domain.result import Err, Ok, Result
 from trader.ledger.benchmark_repository import list_benchmark_prices, list_position_marks
@@ -71,6 +71,13 @@ def _in_window(moment: datetime | None, start: date, end: date) -> bool:
     return start < trading_day(moment) <= end
 
 
+def _held_on(trades: Iterable[Trade], positions: Iterable[Position], day: date) -> bool:
+    """True when something was held at the close of `day` (LR-2)."""
+    if any(trading_day(p.opened_at) <= day for p in positions):
+        return True
+    return any(trading_day(t.opened_at) <= day < trading_day(t.closed_at) for t in trades)
+
+
 def _manual_close_count(conn: sqlite3.Connection, trades: Iterable[Trade]) -> int:
     count = 0
     for trade in trades:
@@ -95,6 +102,8 @@ def load_readiness_inputs(
         )
     start = since if since is not None else first
     end = snapshots[-1][0] if snapshots else None
+    if since is not None and end is not None and since > end:
+        return Err(ReadinessInputsError("--since は評価日(最新 snapshot)以前を指定してください"))
     trades = list_trades(conn)
     kills = tuple(
         (c.id, c.error_summary or "")
@@ -123,10 +132,19 @@ def load_readiness_inputs(
     )
     if start is None or end is None:
         return Ok(base)
+    positions = list_positions(conn)
     unreal_end: dict[str, Money] | None = _marks(conn, end)
-    if not unreal_end and list_positions(conn):
+    if not unreal_end and positions:
         unreal_end = None
         missing.append("position_marks")
+    elif unreal_end is not None:
+        absent = sorted(p.ticker for p in positions if p.ticker not in unreal_end)
+        if absent:
+            missing.append(f"position_marks({', '.join(absent)})")
+    unreal_start: dict[str, Money] | None = _marks(conn, start)
+    if not unreal_start and start != first and _held_on(trades, positions, start):
+        unreal_start = None
+        missing.append("position_marks(S)")
     b_start = _benchmark_point(conn, start, forward=True)
     b_end = _benchmark_point(conn, end, forward=False)
     if b_start is None or b_end is None:
@@ -145,7 +163,7 @@ def load_readiness_inputs(
             realized_end_by_ticker=_sum_by_ticker(
                 t for t in trades if trading_day(t.closed_at) <= end
             ),
-            unreal_start_by_ticker=_marks(conn, start),
+            unreal_start_by_ticker=unreal_start,
             unreal_end_by_ticker=unreal_end,
             benchmark_start=b_start,
             benchmark_end=b_end,

@@ -149,13 +149,14 @@ def render_readiness(readiness: Readiness) -> list[str]:
     unrealized = (
         readiness.unrealized_pnl.amount if readiness.unrealized_pnl is not None else "未取得"
     )
+    capital = readiness.capital.amount if readiness.capital is not None else "未取得"
     elapsed = "なし" if readiness.elapsed_days is None else f"{readiness.elapsed_days} 日"
     lines = [
         "## 移行条件（paper → 少額実弾）",
         f"起点日: {_fmt_day(readiness.start_date)} / 評価日: {_fmt_day(readiness.end_date)} "
         f"/ 経過日数: {elapsed}",
         f"ポートフォリオ損益率 P: {_fmt_pct(readiness.p_pct)}"
-        f"（実現 {realized} / 評価 {unrealized}）",
+        f"（実現 {realized} / 評価 {unrealized} / capital {capital}）",
         f"コスト控除後 P_net: {_fmt_pct(readiness.p_net_pct)}",
         f"SPY リターン B: {_fmt_pct(readiness.benchmark_pct)}"
         f"（{_benchmark_note(readiness.benchmark_start, readiness.benchmark_end)}）",

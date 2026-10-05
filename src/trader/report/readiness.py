@@ -42,7 +42,7 @@ class ReadinessInputs:
     capital: Money
     realized_start_by_ticker: Mapping[str, Money]
     realized_end_by_ticker: Mapping[str, Money]
-    unreal_start_by_ticker: Mapping[str, Money]
+    unreal_start_by_ticker: Mapping[str, Money] | None
     unreal_end_by_ticker: Mapping[str, Money] | None
     benchmark_start: BenchmarkPoint | None
     benchmark_end: BenchmarkPoint | None
@@ -91,6 +91,7 @@ class Readiness:
     manual_close_count: int
     conditions: tuple[ConditionResult, ...]
     missing: tuple[str, ...]
+    capital: Money | None = None
 
 
 def _q(value: Decimal) -> Decimal:
@@ -111,11 +112,13 @@ def _benchmark_pct(start: BenchmarkPoint | None, end: BenchmarkPoint | None) -> 
     return _q((end.close / start.close - Decimal(1)) * _HUNDRED)
 
 
-def _best_ticker_pnl(inputs: ReadinessInputs, unreal_end: Mapping[str, Money]) -> Decimal:
+def _best_ticker_pnl(
+    inputs: ReadinessInputs, unreal_start: Mapping[str, Money], unreal_end: Mapping[str, Money]
+) -> Decimal:
     tickers = (
         set(inputs.realized_start_by_ticker)
         | set(inputs.realized_end_by_ticker)
-        | set(inputs.unreal_start_by_ticker)
+        | set(unreal_start)
         | set(unreal_end)
     )
 
@@ -127,7 +130,7 @@ def _best_ticker_pnl(inputs: ReadinessInputs, unreal_end: Mapping[str, Money]) -
         amount(inputs.realized_end_by_ticker, t)
         + amount(unreal_end, t)
         - amount(inputs.realized_start_by_ticker, t)
-        - amount(inputs.unreal_start_by_ticker, t)
+        - amount(unreal_start, t)
         for t in tickers
     ]
     return max([_ZERO, *pnls])
@@ -181,10 +184,10 @@ def _cond_2_3(p: Decimal | None, p_ex: Decimal | None, b: Decimal | None) -> lis
     ]
 
 
-def _cond_4a(live_pnl: Money | None) -> ConditionResult:
+def _cond_4a(live_pnl: Money | None, b: Decimal | None) -> ConditionResult:
     label = "実弾期待値(コスト控除後)"
-    if live_pnl is None:
-        return _undetermined("4a", label, "評価損益が未取得")
+    if live_pnl is None or b is None:  # spec table: "条件 2 と同じ"
+        return _undetermined("4a", label, "SPY または評価損益が未取得")
     return ConditionResult(
         "4a", label, _verdict(live_pnl.amount > _ZERO), f"推定損益 {live_pnl.amount} USD"
     )
@@ -223,18 +226,19 @@ def evaluate_readiness(inputs: ReadinessInputs) -> Readiness:
     realized = Money(
         _total(inputs.realized_end_by_ticker) - _total(inputs.realized_start_by_ticker)
     )
+    unreal_start = inputs.unreal_start_by_ticker
     unrealized = (
         None
-        if unreal_end is None
-        else Money(_total(unreal_end) - _total(inputs.unreal_start_by_ticker))
+        if unreal_end is None or unreal_start is None
+        else Money(_total(unreal_end) - _total(unreal_start))
     )
     window = None if unrealized is None else realized + unrealized
     bench = _benchmark_pct(inputs.benchmark_start, inputs.benchmark_end)
     p = p_ex = p_net = None
     live = None
-    if window is not None and unreal_end is not None:
+    if window is not None and unreal_end is not None and unreal_start is not None:
         p = _pct(window.amount, capital)
-        p_ex = _pct(window.amount - _best_ticker_pnl(inputs, unreal_end), capital)
+        p_ex = _pct(window.amount - _best_ticker_pnl(inputs, unreal_start, unreal_end), capital)
         live = estimate(
             window, inputs.window_fills, inputs.window_order_count, inputs.capital, inputs.cost
         ).estimated_live_pnl
@@ -243,7 +247,7 @@ def evaluate_readiness(inputs: ReadinessInputs) -> Readiness:
     conditions = (
         _cond_1(elapsed),
         *_cond_2_3(p, p_ex, bench),
-        _cond_4a(live),
+        _cond_4a(live, bench),
         _cond_4b(dd, inputs.max_weekly_loss_pct),
         _cond_4c(inputs.kill_switch_events),
         _cond_5(inputs.manual_close_count),
@@ -267,4 +271,5 @@ def evaluate_readiness(inputs: ReadinessInputs) -> Readiness:
         manual_close_count=inputs.manual_close_count,
         conditions=conditions,
         missing=inputs.missing,
+        capital=inputs.capital,
     )

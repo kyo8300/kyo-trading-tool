@@ -195,7 +195,9 @@ def _finish(
 def _find_or_create_decision(
     deps: CloseDeps, cycle_id: str, checked: _Checked, reason: str | None, now: datetime
 ) -> Result[Decision, CloseError]:
-    existing = _reusable_decision(deps.conn, checked.position.ticker, now)
+    existing = _reusable_decision(
+        deps.conn, checked.position.ticker, checked.position.qty.shares, now
+    )
     if existing is not None:
         return Ok(existing)
     shares = checked.position.qty.shares
@@ -225,19 +227,31 @@ def _find_or_create_decision(
     return Ok(decision)
 
 
-def _reusable_decision(conn: sqlite3.Connection, ticker: str, now: datetime) -> Decision | None:
-    """Newest same-ET-day, unordered manual sell decision (LR-20)."""
+def _reusable_decision(
+    conn: sqlite3.Connection, ticker: str, shares: int, now: datetime
+) -> Decision | None:
+    """Newest same-ET-day, unordered manual sell decision of `shares` (LR-20)."""
     today = loss_limits.trading_day(now)
     for decision in list_decisions(conn):  # newest first
         if (
             decision.origin is Origin.manual
             and decision.action is Action.sell
             and decision.ticker == ticker
+            and _decision_shares(decision) == shares
             and loss_limits.trading_day(decision.decided_at) == today
             and get_order(conn, f"order_{decision.id}") is None
         ):
             return decision
     return None
+
+
+def _decision_shares(decision: Decision) -> int | None:
+    if decision.proposed_notional is None or decision.reference_price is None:
+        return None
+    price = decision.reference_price.amount
+    if price <= 0:
+        return None
+    return int(decision.proposed_notional.amount / price)
 
 
 def _read_result(
@@ -274,23 +288,24 @@ def _build_outcome(
         (t for t in list_trades(deps.conn) if decision.id in t.exit_decision_ids),
         None,
     )
+    filled_qty, avg_price = _fill_summary(deps.conn, order.id)
     return CloseOutcome(
         cycle_id=cycle_id,
         decision_id=decision.id,
         order_id=order.id,
         order_status=status,
-        filled_qty=order.qty.shares if status is OrderStatus.filled else 0,
-        avg_fill_price=_average_fill_price(deps.conn, order.id),
+        filled_qty=filled_qty,
+        avg_fill_price=avg_price,
         trade=trade,
         slot_freed=trade is not None,
     )
 
 
-def _average_fill_price(conn: sqlite3.Connection, order_id: str) -> Price | None:
-    """Quantity-weighted average price over the order's fills (LR-22)."""
+def _fill_summary(conn: sqlite3.Connection, order_id: str) -> tuple[int, Price | None]:
+    """Total filled shares and quantity-weighted average price (LR-22)."""
     fills = list_fills(conn, order_id)
     total_qty = sum(f.qty.shares for f in fills)
     if total_qty == 0:
-        return None
+        return 0, None
     notional = sum((f.price.amount * Decimal(f.qty.shares) for f in fills), Decimal(0))
-    return Price(notional / Decimal(total_qty))
+    return total_qty, Price(notional / Decimal(total_qty))
