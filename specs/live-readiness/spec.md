@@ -3,7 +3,7 @@
 - 元 intent: `specs/live-readiness/intent.md`（approved_by: kyo, approved_at: 2026-10-06）
 - 親 spec: `specs/ai-auto-trader/spec.md`（Q5 / R-22 / R-23 を変更対象とする。R-番号・N-番号・AC-番号は親 spec のもの）
 - 作成日: 2026-10-06
-- 状態: draft
+- 状態: approved
 
 > **kyo へ**: intent で「spec で詰める」とされた 7 点（6 週の起点 / コスト控除後を判定に使うか / 「上回る」の最小マージン / SPY 配当 / close の decision origin / close の実行タイミング / SPY 価格の取得元）は「設計判断」で推奨案を決めて理由を書いた。
 > 本当に kyo の判断が要るものだけ「kyo 確認事項」に 5 つ列挙した（推奨付き。承認時に「推奨どおり」で済む）。
@@ -310,5 +310,5 @@ trader report [--since]（変更）
 
 ## 承認
 
-approved_by:
-approved_at:
+approved_by: kyo
+approved_at: 2026-10-06
