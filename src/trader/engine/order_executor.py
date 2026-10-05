@@ -27,6 +27,7 @@ from trader.domain.result import Err, Ok, Result
 from trader.engine.approval import ApprovedOrderRequest
 from trader.ledger.db import transaction
 from trader.ledger.repository import (
+    get_approval,
     get_decision,
     insert_approval,
     insert_decision,
@@ -82,9 +83,10 @@ def execute(
                 if isinstance(decision_result, Err):
                     raise _RecordError(decision_result.error.message)
 
-            approval_result = insert_approval(tx, req.approval)
-            if isinstance(approval_result, Err):
-                raise _RecordError(approval_result.error.message)
+            if get_approval(tx, req.approval.id) is None:
+                approval_result = insert_approval(tx, req.approval)
+                if isinstance(approval_result, Err):
+                    raise _RecordError(approval_result.error.message)
 
             order_result = insert_order(tx, order)
             if isinstance(order_result, Err):

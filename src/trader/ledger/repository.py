@@ -317,6 +317,12 @@ def get_order(conn: sqlite3.Connection, order_id: str) -> Order | None:
     return _row_to_order(row) if row is not None else None
 
 
+def get_approval(conn: sqlite3.Connection, approval_id: str) -> Approval | None:
+    """Return the approval with `approval_id`, or `None` if it does not exist."""
+    row = conn.execute("SELECT * FROM approvals WHERE id = ?", (approval_id,)).fetchone()
+    return _row_to_approval(row) if row is not None else None
+
+
 def find_valid_approval(
     conn: sqlite3.Connection, decision_id: str, now: datetime
 ) -> Approval | None:

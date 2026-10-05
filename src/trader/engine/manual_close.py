@@ -43,7 +43,7 @@ from trader.ledger.portfolio_repository import (
     insert_cycle,
     list_trades,
 )
-from trader.ledger.repository import get_order, insert_decision, list_decisions
+from trader.ledger.repository import get_order, insert_decision, list_decisions, list_fills
 from trader.market.data_provider import MarketClock, MarketDataProvider
 from trader.rules import loss_limits
 from trader.rules.schema import RuleSet
@@ -280,7 +280,17 @@ def _build_outcome(
         order_id=order.id,
         order_status=status,
         filled_qty=order.qty.shares if status is OrderStatus.filled else 0,
-        avg_fill_price=None,
+        avg_fill_price=_average_fill_price(deps.conn, order.id),
         trade=trade,
         slot_freed=trade is not None,
     )
+
+
+def _average_fill_price(conn: sqlite3.Connection, order_id: str) -> Price | None:
+    """Quantity-weighted average price over the order's fills (LR-22)."""
+    fills = list_fills(conn, order_id)
+    total_qty = sum(f.qty.shares for f in fills)
+    if total_qty == 0:
+        return None
+    notional = sum((f.price.amount * Decimal(f.qty.shares) for f in fills), Decimal(0))
+    return Price(notional / Decimal(total_qty))
