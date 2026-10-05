@@ -218,7 +218,7 @@ def _find_or_create_decision(
         rule_set_sha256=deps.rule_set_sha256,
         rule_check=RuleCheck.passed,
         rule_check_reason=_RULE_CHECK_REASON,
-        proposed_notional=Money(checked.price.amount * Decimal(shares)),
+        proposed_notional=_close_notional(checked.price, shares),
         reference_price=checked.price,
     )
     insert_result = insert_decision(deps.conn, decision)
@@ -237,7 +237,7 @@ def _reusable_decision(
             decision.origin is Origin.manual
             and decision.action is Action.sell
             and decision.ticker == ticker
-            and _decision_shares(decision) == shares
+            and _matches_shares(decision, shares)
             and loss_limits.trading_day(decision.decided_at) == today
             and get_order(conn, f"order_{decision.id}") is None
         ):
@@ -245,13 +245,15 @@ def _reusable_decision(
     return None
 
 
-def _decision_shares(decision: Decision) -> int | None:
+def _close_notional(price: Price, shares: int) -> Money:
+    """Notional of a full close; shared by decision creation and reuse matching."""
+    return Money(price.amount * Decimal(shares))
+
+
+def _matches_shares(decision: Decision, shares: int) -> bool:
     if decision.proposed_notional is None or decision.reference_price is None:
-        return None
-    price = decision.reference_price.amount
-    if price <= 0:
-        return None
-    return int(decision.proposed_notional.amount / price)
+        return False
+    return decision.proposed_notional == _close_notional(decision.reference_price, shares)
 
 
 def _read_result(

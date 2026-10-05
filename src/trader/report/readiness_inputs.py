@@ -71,11 +71,15 @@ def _in_window(moment: datetime | None, start: date, end: date) -> bool:
     return start < trading_day(moment) <= end
 
 
-def _held_on(trades: Iterable[Trade], positions: Iterable[Position], day: date) -> bool:
-    """True when something was held at the close of `day` (LR-2)."""
-    if any(trading_day(p.opened_at) <= day for p in positions):
-        return True
-    return any(trading_day(t.opened_at) <= day < trading_day(t.closed_at) for t in trades)
+def _held_tickers(
+    trades: Iterable[Trade], positions: Iterable[Position], day: date
+) -> frozenset[str]:
+    """Tickers held at the close of `day` (LR-2)."""
+    open_now = {p.ticker for p in positions if trading_day(p.opened_at) <= day}
+    closed_later = {
+        t.ticker for t in trades if trading_day(t.opened_at) <= day < trading_day(t.closed_at)
+    }
+    return frozenset(open_now | closed_later)
 
 
 def _manual_close_count(conn: sqlite3.Connection, trades: Iterable[Trade]) -> int:
@@ -140,11 +144,14 @@ def load_readiness_inputs(
     elif unreal_end is not None:
         absent = sorted(p.ticker for p in positions if p.ticker not in unreal_end)
         if absent:
+            unreal_end = None
             missing.append(f"position_marks({', '.join(absent)})")
     unreal_start: dict[str, Money] | None = _marks(conn, start)
-    if not unreal_start and start != first and _held_on(trades, positions, start):
-        unreal_start = None
-        missing.append("position_marks(S)")
+    if start != first:
+        held = _held_tickers(trades, positions, start)
+        if held and any(t not in (unreal_start or {}) for t in held):
+            unreal_start = None
+            missing.append("position_marks(S)")
     b_start = _benchmark_point(conn, start, forward=True)
     b_end = _benchmark_point(conn, end, forward=False)
     if b_start is None or b_end is None:
