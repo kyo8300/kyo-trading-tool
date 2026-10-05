@@ -184,7 +184,7 @@ def _cond_2_3(p: Decimal | None, p_ex: Decimal | None, b: Decimal | None) -> lis
 def _cond_4a(live_pnl: Money | None) -> ConditionResult:
     label = "実弾期待値(コスト控除後)"
     if live_pnl is None:
-        return _undetermined("4a", label, "SPY または評価損益が未取得")
+        return _undetermined("4a", label, "評価損益が未取得")
     return ConditionResult(
         "4a", label, _verdict(live_pnl.amount > _ZERO), f"推定損益 {live_pnl.amount} USD"
     )
@@ -239,12 +239,11 @@ def evaluate_readiness(inputs: ReadinessInputs) -> Readiness:
             window, inputs.window_fills, inputs.window_order_count, inputs.capital, inputs.cost
         ).estimated_live_pnl
         p_net = _pct(live.amount, capital)
-    determinable = bench is not None and window is not None
     dd = _max_drawdown_pct(inputs.equity_series, capital)
     conditions = (
         _cond_1(elapsed),
         *_cond_2_3(p, p_ex, bench),
-        _cond_4a(live if determinable else None),
+        _cond_4a(live),
         _cond_4b(dd, inputs.max_weekly_loss_pct),
         _cond_4c(inputs.kill_switch_events),
         _cond_5(inputs.manual_close_count),
