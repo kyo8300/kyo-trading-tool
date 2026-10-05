@@ -166,10 +166,14 @@ def test_ac16_condition4a_positive_estimate_is_met() -> None:
     assert _verdict(_inputs(), "4a") is Verdict.met
 
 
-def test_ac16_condition4a_is_judged_without_spy_data() -> None:
-    # LR-5: 4(a) needs only paper P&L and costs, not the benchmark.
+def test_ac16_condition4a_is_undetermined_without_benchmark() -> None:
+    # spec table: 4a is undetermined under the same rule as condition 2 (B or unreal(E) missing).
     inputs = _inputs(benchmark_start=None, benchmark_end=None)
-    assert _verdict(inputs, "4a") is Verdict.met
+    assert _verdict(inputs, "4a") is Verdict.undetermined
+
+
+def test_ac16_condition4a_is_undetermined_without_end_marks() -> None:
+    assert _verdict(_inputs(unreal_end_by_ticker=None), "4a") is Verdict.undetermined
 
 
 def test_ac16_drawdown_denominator_is_capital() -> None:
@@ -248,3 +252,9 @@ def test_ac16_all_percentages_are_decimal_with_two_places() -> None:
     for value in (readiness.p_pct, readiness.p_ex_pct, readiness.p_net_pct, readiness.dd_cap_pct):
         assert isinstance(value, Decimal)
         assert value.as_tuple().exponent == -2
+
+
+def test_ac16_missing_start_marks_make_conditions_2_3_4a_undetermined() -> None:
+    inputs = _inputs(unreal_start_by_ticker=None)
+    assert [_verdict(inputs, n) for n in ("2", "3", "4a")] == [Verdict.undetermined] * 3
+    assert _verdict(inputs, "1") is Verdict.met

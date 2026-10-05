@@ -368,3 +368,65 @@ def test_live_with_expired_approval_does_not_submit(tmp_path: Path) -> None:
     assert _count(conn, "orders") == 0
     assert len(list_positions(conn)) == 1
     conn.close()
+
+
+@dataclass
+class _PartialBroker(_FillBroker):
+    """Reports a partial fill of 3 shares forever."""
+
+    def get_order(self, client_order_id: str) -> Result[BrokerOrder, BrokerError]:
+        req = self._orders[client_order_id]
+        return Ok(
+            BrokerOrder(
+                broker_order_id=f"b_{client_order_id}",
+                client_order_id=client_order_id,
+                status=OrderStatus.partially_filled,
+                filled_qty=Quantity(3),
+                filled_avg_price=self.fill_price,
+                updated_at=_NOW,
+            )
+            if req.qty.shares > 3
+            else self._order(req, OrderStatus.filled)
+        )
+
+
+def test_paper_happy_path_partial_fill_reports_summed_fill_qty(tmp_path: Path) -> None:
+    conn, sha, rules = _setup(tmp_path)
+    broker = _PartialBroker(Price(_FILL))
+
+    result = close_position(_deps(conn, sha, rules, broker), "ZZZZ", None)
+
+    assert isinstance(result, Ok)
+    fills = conn.execute("SELECT qty FROM fills").fetchall()
+    assert sum(int(r[0]) for r in fills) == result.value.filled_qty
+    assert result.value.filled_qty == 3
+    assert result.value.filled_qty != _QTY
+    conn.close()
+
+
+def test_live_rerun_with_changed_position_qty_creates_a_new_decision(tmp_path: Path) -> None:
+    conn, sha, rules = _setup(tmp_path)
+    broker = _FillBroker(Price(_FILL))
+    deps = _deps(conn, sha, rules, broker, TradingMode.live)
+    first = close_position(deps, "ZZZZ", None)
+    assert isinstance(first, Err)
+    smaller = Position(
+        ticker="ZZZZ",
+        qty=Quantity(_QTY - 2),
+        avg_cost=Price(_AVG_COST),
+        opened_at=_NOW - timedelta(days=3),
+        high_watermark=Price(_AVG_COST),
+        partial_tp_done=False,
+    )
+    assert isinstance(upsert_position(conn, smaller), Ok)
+
+    second = close_position(deps, "ZZZZ", None)
+
+    assert isinstance(second, Err)
+    decisions = list_decisions(conn)
+    assert len(decisions) == 2
+    new = next(d for d in decisions if d.proposed_notional == Money(_FILL * (_QTY - 2)))
+    assert new.id in second.error.message
+    assert new.id not in first.error.message
+    assert broker.submitted == []
+    conn.close()

@@ -486,6 +486,39 @@ def test_report_with_since_before_first_snapshot_exits_1(tmp_path: Path) -> None
     assert "trader report:" in result.output
 
 
+def test_report_with_since_after_latest_snapshot_exits_1(tmp_path: Path) -> None:
+    db_path = tmp_path / "trader.sqlite3"
+    conn = open_db(db_path).value
+    with transaction(conn):
+        portfolio_repo.upsert_equity_snapshot(
+            conn,
+            "2026-01-05",
+            "paper",
+            Money(Decimal("2500")),
+            Money(Decimal("0")),
+            Money(Decimal("2500")),
+            Decimal("0"),
+            _NOW,
+        )
+    conn.close()
+
+    result = runner.invoke(
+        app,
+        [
+            "report",
+            "--db",
+            str(db_path),
+            "--rules",
+            str(_readiness_rules_path()),
+            "--since",
+            "2026-01-09",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "trader report:" in result.output
+
+
 def test_close_refuses_to_run_in_the_test_environment() -> None:
     result = runner.invoke(app, ["close", "ABCD"])
     assert result.exit_code == 1

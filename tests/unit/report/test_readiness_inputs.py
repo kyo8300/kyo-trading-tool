@@ -467,3 +467,83 @@ def test_ac17_window_fills_and_orders_are_limited_to_start_through_end(conn) -> 
     # window is (S, E] to match PnL(E) - PnL(S): before/start/after-E are excluded
     assert inputs.window_order_count == 1
     assert sorted(f.id for f in inputs.window_fills) == ["f-o-in"]
+
+
+def _hold(conn, ticker: str, opened: str) -> None:
+    opened_at = datetime.fromisoformat(f"{opened}T15:00:00+00:00")
+    held = Position(ticker, Quantity(1), Price(Decimal(10)), opened_at, Price(Decimal(10)), False)
+    assert isinstance(portfolio_repo.upsert_position(conn, held), Ok)
+
+
+def test_ac17_since_with_holding_at_s_and_no_mark_is_missing_start_marks(conn) -> None:
+    for day in ("2026-09-14", "2026-09-16", "2026-09-18"):
+        _snapshot(conn, day)
+    _hold(conn, "AAA", "2026-09-14")
+    _mark(conn, "2026-09-18", "AAA", "4")
+    inputs = _ok(conn, date(2026, 9, 16))
+    assert inputs.unreal_start_by_ticker is None
+    assert "position_marks(S)" in inputs.missing
+
+
+def test_ac17_since_with_closed_trade_spanning_s_and_no_mark_is_missing_start_marks(conn) -> None:
+    for day in ("2026-09-14", "2026-09-16", "2026-09-18"):
+        _snapshot(conn, day)
+    _decision(conn, "entry-span", Origin.llm)
+    opened = datetime(2026, 9, 14, 15, 0, tzinfo=UTC)
+    closed = datetime(2026, 9, 17, 15, 0, tzinfo=UTC)  # opened <= S < closed
+    trade = Trade(
+        "span", "AAA", opened, closed, "entry-span", (), ExitReason.llm,
+        Money(Decimal(3)), Money(Decimal(0)), 3,
+    )  # fmt: skip
+    assert isinstance(portfolio_repo.insert_trade(conn, trade), Ok)
+    inputs = _ok(conn, date(2026, 9, 16))
+    assert inputs.unreal_start_by_ticker is None
+    assert "position_marks(S)" in inputs.missing
+
+
+def test_ac17_since_after_trade_closed_does_not_need_start_marks(conn) -> None:
+    for day in ("2026-09-14", "2026-09-16", "2026-09-18"):
+        _snapshot(conn, day)
+    _trade(conn, "done", "AAA", "2026-09-15", "3")  # closed before S: not held at S
+    inputs = _ok(conn, date(2026, 9, 16))
+    assert dict(inputs.unreal_start_by_ticker) == {}
+    assert "position_marks(S)" not in inputs.missing
+
+
+def test_ac17_since_with_holding_and_mark_at_s_is_not_missing(conn) -> None:
+    for day in ("2026-09-14", "2026-09-16", "2026-09-18"):
+        _snapshot(conn, day)
+    _hold(conn, "AAA", "2026-09-14")
+    _mark(conn, "2026-09-16", "AAA", "2")
+    _mark(conn, "2026-09-18", "AAA", "4")
+    inputs = _ok(conn, date(2026, 9, 16))
+    assert dict(inputs.unreal_start_by_ticker) == {"AAA": Money(Decimal(2))}
+    assert "position_marks(S)" not in inputs.missing
+
+
+def test_ac17_start_at_paper_start_day_without_mark_is_zero_not_missing(conn) -> None:
+    for day in ("2026-09-14", "2026-09-18"):
+        _snapshot(conn, day)
+    _hold(conn, "AAA", "2026-09-14")
+    _mark(conn, "2026-09-18", "AAA", "4")
+    inputs = _ok(conn)
+    assert dict(inputs.unreal_start_by_ticker) == {}
+    assert "position_marks(S)" not in inputs.missing
+
+
+def test_ac17_partial_end_marks_name_the_tickers_without_a_mark(conn) -> None:
+    for day in ("2026-09-14", "2026-09-18"):
+        _snapshot(conn, day)
+    _hold(conn, "AAA", "2026-09-14")
+    _hold(conn, "BBB", "2026-09-14")
+    _mark(conn, "2026-09-18", "AAA", "4")
+    inputs = _ok(conn)
+    assert any("position_marks" in m and "BBB" in m and "AAA" not in m for m in inputs.missing)
+
+
+def test_ac17_since_after_end_is_err(conn) -> None:
+    for day in ("2026-09-14", "2026-09-18"):
+        _snapshot(conn, day)
+    result = load_readiness_inputs(conn, _rules(), date(2026, 9, 19))
+    assert isinstance(result, Err)
+    assert result.error.message

@@ -174,3 +174,9 @@ def test_ac18_render_report_with_readiness_appends_section_at_the_end() -> None:
     )
 
     assert out.index("## トレード一覧") < out.index("## 移行条件")
+
+
+def test_ac18_p_line_shows_capital() -> None:
+    lines = render_readiness(_readiness(capital=Money(Decimal("2500"))))
+    p_line = next(ln for ln in lines if ln.startswith("ポートフォリオ損益率 P:"))
+    assert "capital 2500" in p_line
